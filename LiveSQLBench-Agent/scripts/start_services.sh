@@ -7,15 +7,13 @@ export PYTHONPATH="$PROJECT_DIR"
 export NO_PROXY="${NO_PROXY:-127.0.0.1,localhost}"
 export no_proxy="${no_proxy:-127.0.0.1,localhost}"
 
-PYTHON_BIN="python"
+PYTHON_BIN="$PROJECT_DIR/../.venv/bin/python"
+
 if [ -x "$PROJECT_DIR/.conda-py310/bin/python" ]; then
     PYTHON_BIN="$PROJECT_DIR/.conda-py310/bin/python"
-elif [ -n "${CONDA_PREFIX:-}" ] && [ -x "${CONDA_PREFIX}/bin/python" ]; then
-    PYTHON_BIN="${CONDA_PREFIX}/bin/python"
 elif [ -x "$PROJECT_DIR/.venv-adk/bin/python" ]; then
     PYTHON_BIN="$PROJECT_DIR/.venv-adk/bin/python"
 fi
-
 HOST="${SERVICE_HOST:-127.0.0.1}"
 
 pkill -f uvicorn 2>/dev/null || true

@@ -122,3 +122,8 @@ async def run_single_task(task_data: dict) -> Dict[str, Any]:
         return result
     finally:
         await cleanup_task_service(instance_id)
+
+
+# i want to create a database-disjoint split to test whether the agent generalises to unseen databases.
+
+# i should also add a output that is in pandas format to help in generating plots and analysis. 
