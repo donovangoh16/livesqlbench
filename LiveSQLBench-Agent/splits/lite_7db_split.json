@@ -1,0 +1,29 @@
+{
+  "source": "livesqlbench-base-lite/livesqlbench_data_with_gt.jsonl",
+  "train_databases": [
+    "credit",
+    "cybermarket",
+    "gaming",
+    "museum",
+    "solar"
+  ],
+  "test_databases": [
+    "archeology",
+    "cross_db"
+  ],
+  "train_tasks": 75,
+  "test_tasks": 30,
+  "excluded_databases": [
+    "alien",
+    "crypto",
+    "disaster",
+    "fake",
+    "insider",
+    "mental",
+    "news",
+    "polar",
+    "robot",
+    "vaccine",
+    "virtual"
+  ]
+}
