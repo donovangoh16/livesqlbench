@@ -21,33 +21,13 @@ except ImportError as exc:
 logger = logging.getLogger(__name__)
 
 from shared.llm import build_adk_model as _build_model
+from system_agent.prompts import BASELINE_INSTRUCTION, get_instruction
 
-INSTRUCTION = """You are a PostgreSQL expert. Your task is to write a SQL query that answers the user's question about a database.
-
-You have access to tools that let you explore the database and submit your answer. Each tool call costs 1 step. You will be told how many steps remain after each action.
-
-Available tools:
-- get_schema: get the database schema (CREATE TABLE statements). Cost: 1 step
-- get_all_column_meanings: get descriptions of all columns. Cost: 1 step
-- get_column_meaning: get the description of one specific column. Cost: 1 step
-- get_all_external_knowledge_names: list available domain knowledge entries. Cost: 1 step
-- get_knowledge_definition: get one knowledge entry's definition. Cost: 1 step
-- get_all_knowledge_definitions: get all knowledge definitions. Cost: 1 step
-- execute_sql: run a SQL query and see results. Cost: 1 step
-- submit_sql: submit your final SQL answer. Cost: 1 step
-
-IMPORTANT RULES:
-- You have ONE submission attempt. Once you call submit_sql, the task ends — pass or fail.
-- Be confident before submitting. Test your SQL with execute_sql first.
-- Be efficient with steps. A good strategy:
-  1. Get the schema to understand the tables.
-  2. Check external knowledge if the question involves domain-specific terms.
-  3. Write and test your SQL with execute_sql.
-  4. Submit when confident.
-"""
+# Backwards-compatible name for code that imports the original prompt.
+INSTRUCTION = BASELINE_INSTRUCTION
 
 
-def build_agent() -> Agent:
+def build_agent(profile: str = "baseline") -> Agent:
     """Build the single-turn text-to-SQL agent."""
     if not ADK_AVAILABLE:
         raise RuntimeError(f"google-adk runtime unavailable: {ADK_IMPORT_ERROR}")
@@ -62,8 +42,8 @@ def build_agent() -> Agent:
         model=model,
         name="bird_interact_agent",
         description="Single-turn text-to-SQL agent.",
-        instruction=INSTRUCTION,
-        tools=get_tools(),
+        instruction=get_instruction(profile),
+        tools=get_tools(profile),
         before_model_callback=before_model_callback,
         before_tool_callback=before_tool_callback,
         after_tool_callback=after_tool_callback,

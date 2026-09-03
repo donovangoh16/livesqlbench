@@ -21,6 +21,7 @@ class _SessionRef:
     app_name: str
     user_id: str
     session_id: str
+    agent_profile: str
 
 
 class AdkRuntime:
@@ -30,7 +31,7 @@ class AdkRuntime:
         self.available = False
         self.error = ""
         self._backend: Optional[Dict[str, Any]] = None
-        self._runner: Optional[Any] = None
+        self._runners: Dict[str, Any] = {}
         self._app_name: str = "bird_interact_single_turn"
         self._session_refs: Dict[str, _SessionRef] = {}
         self._lock = asyncio.Lock()
@@ -66,25 +67,27 @@ class AdkRuntime:
             self.available = False
             logger.warning("ADK runtime unavailable: %s", exc)
 
-    async def _get_runner(self) -> Any:
-        if self._runner is not None:
-            return self._runner
+    async def _get_runner(self, agent_profile: str = "baseline") -> Any:
+        if agent_profile in self._runners:
+            return self._runners[agent_profile]
         if not self.available or self._backend is None:
             raise RuntimeError(self.error or "ADK runtime unavailable")
 
-        agent = self._backend["build_agent"]()
+        agent = self._backend["build_agent"](profile=agent_profile)
+        app_name = f"{self._app_name}_{agent_profile}"
 
         if self._backend["runner_kind"] == "in_memory":
-            self._runner = self._backend["runner_cls"](agent=agent, app_name=self._app_name)
+            runner = self._backend["runner_cls"](agent=agent, app_name=app_name)
         else:
             session_service = self._backend["session_service_cls"]()
-            self._runner = self._backend["runner_cls"](
+            runner = self._backend["runner_cls"](
                 agent=agent,
-                app_name=self._app_name,
+                app_name=app_name,
                 session_service=session_service,
             )
 
-        return self._runner
+        self._runners[agent_profile] = runner
+        return runner
 
     def _make_text_message(self, text: str) -> Any:
         if not self.available or self._backend is None:
@@ -166,10 +169,62 @@ class AdkRuntime:
 
         return {"type": "unknown", "repr": self._preview(part)}
 
+    @staticmethod
+    def _serialize_usage(usage: Any) -> Dict[str, int]:
+        """Normalize provider usage metadata without estimating missing tokens."""
+        if usage is None:
+            return {}
+
+        def value(*names: str) -> int:
+            for name in names:
+                raw = getattr(usage, name, None)
+                if raw is None and isinstance(usage, dict):
+                    raw = usage.get(name)
+                if raw is not None:
+                    try:
+                        return int(raw)
+                    except (TypeError, ValueError):
+                        return 0
+            return 0
+
+        prompt = value("prompt_token_count", "input_tokens")
+        output = value("candidates_token_count", "response_token_count", "output_tokens")
+        cached = value(
+            "cached_content_token_count", "cache_read_input_tokens", "cached_tokens"
+        )
+        total = value("total_token_count", "total_tokens") or prompt + output
+        return {
+            "input_tokens": prompt,
+            "output_tokens": output,
+            "total_tokens": total,
+            "cached_input_tokens": cached,
+            "uncached_input_tokens": max(0, prompt - cached),
+            "thought_tokens": value("thoughts_token_count"),
+            "tool_prompt_tokens": value("tool_use_prompt_token_count"),
+        }
+
+    @staticmethod
+    def _sum_usage(events: list[Dict[str, Any]]) -> Dict[str, int]:
+        keys = (
+            "input_tokens", "output_tokens", "total_tokens",
+            "cached_input_tokens", "uncached_input_tokens",
+            "thought_tokens", "tool_prompt_tokens",
+        )
+        totals = {key: 0 for key in keys}
+        usage_events = 0
+        for event in events:
+            usage = event.get("usage") or {}
+            if usage:
+                usage_events += 1
+                for key in keys:
+                    totals[key] += int(usage.get(key, 0) or 0)
+        totals["usage_event_count"] = usage_events
+        return totals
+
     def _serialize_event(self, event: Any) -> Dict[str, Any]:
         content = getattr(event, "content", None)
         parts = getattr(content, "parts", None) or []
-        return {
+        serialized = {
             "type": "adk_event",
             "author": getattr(event, "author", ""),
             "invocation_id": getattr(event, "invocation_id", ""),
@@ -180,6 +235,10 @@ class AdkRuntime:
                 "parts": [self._serialize_part(part) for part in parts],
             },
         }
+        usage = self._serialize_usage(getattr(event, "usage_metadata", None))
+        if usage:
+            serialized["usage"] = usage
+        return serialized
 
     async def init_session(
         self,
@@ -188,7 +247,9 @@ class AdkRuntime:
         reset: bool = False,
     ) -> Dict[str, Any]:
         async with self._lock:
-            runner = await self._get_runner()
+            session_state = state or {}
+            agent_profile = session_state.get("active_agent_profile", "baseline")
+            runner = await self._get_runner(agent_profile)
             if task_id in self._session_refs and not reset:
                 ref = self._session_refs[task_id]
                 return {
@@ -199,18 +260,19 @@ class AdkRuntime:
 
             user_id = f"user_{task_id}"
             session = await runner.session_service.create_session(
-                app_name=self._app_name,
+                app_name=f"{self._app_name}_{agent_profile}",
                 user_id=user_id,
-                state=state or {},
+                state=session_state,
             )
             session_state = getattr(session, "state", {}) or {}
             session_state.setdefault("tool_trajectory", [])
             session_state.setdefault("adk_events", [])
             session.state = session_state
             ref = _SessionRef(
-                app_name=self._app_name,
+                app_name=f"{self._app_name}_{agent_profile}",
                 user_id=user_id,
                 session_id=self._session_id(session),
+                agent_profile=agent_profile,
             )
             self._session_refs[task_id] = ref
             return {
@@ -227,8 +289,8 @@ class AdkRuntime:
         if task_id not in self._session_refs:
             await self.init_session(task_id=task_id, state={}, reset=False)
 
-        runner = await self._get_runner()
         ref = self._session_refs[task_id]
+        runner = await self._get_runner(ref.agent_profile)
         new_message = self._make_text_message(message)
 
         final_text = ""
@@ -258,6 +320,7 @@ class AdkRuntime:
         adk_events = session_state.get("adk_events", [])
         adk_events.extend(turn_events)
         session_state["adk_events"] = adk_events
+        session_state["token_usage"] = self._sum_usage(adk_events)
         session.state = session_state
         return {
             "task_id": task_id,

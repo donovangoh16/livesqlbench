@@ -52,6 +52,10 @@ class Settings(BaseSettings):
     # Budget / turns
     patience: int = 3
 
+    # Experiment variant (0-3). Variants 1 and 3 currently activate the
+    # improved four-phase agent prompt; harness behavior remains baseline.
+    experiment_variant: int = 0
+
     @property
     def data_dir(self) -> Path:
         return PROJECT_ROOT / f"livesqlbench-base-{self.dataset}"

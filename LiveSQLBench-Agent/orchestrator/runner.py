@@ -6,6 +6,7 @@ import json
 import logging
 import time
 import traceback
+from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Awaitable, Dict, List
 
@@ -13,6 +14,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from shared.config import settings
+from experiment.variants import get_variant
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -23,6 +25,7 @@ async def run_parallel_evaluation(
     run_single_task: Callable[[dict], Awaitable[Dict[str, Any]]],
     output_path: str,
     concurrency: int = 5,
+    experiment: dict = None,
 ):
     semaphore = asyncio.Semaphore(concurrency)
     results: List[Dict[str, Any]] = []
@@ -30,6 +33,10 @@ async def run_parallel_evaluation(
     total_reward = 0.0
     p1_count = 0
     completed = 0
+    token_totals = {
+        "input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
+        "cached_input_tokens": 0,
+    }
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
 
     async def _save():
@@ -38,12 +45,22 @@ async def run_parallel_evaluation(
             return
         output = {
             "mode": "single-turn",
+            "experiment": experiment or {},
             "metrics": {
                 "total_tasks": n,
                 "total_reward": total_reward,
                 "average_reward": total_reward / n,
                 "phase1_rate": p1_count / n,
                 "phase1_count": p1_count,
+                **token_totals,
+                "average_tokens_per_task": token_totals["total_tokens"] / n,
+                "tokens_per_success": (
+                    token_totals["total_tokens"] / p1_count if p1_count else None
+                ),
+                "prompt_cache_hit_rate": (
+                    token_totals["cached_input_tokens"] / token_totals["input_tokens"]
+                    if token_totals["input_tokens"] else 0.0
+                ),
             },
             "results": results,
         }
@@ -67,6 +84,8 @@ async def run_parallel_evaluation(
             total_reward += r.get("total_reward", 0)
             if r.get("phase1_passed"):
                 p1_count += 1
+            for key in token_totals:
+                token_totals[key] += int(r.get(key, 0) or 0)
             completed += 1
             if completed % 5 == 0 or completed == len(tasks):
                 await _save()
@@ -99,18 +118,33 @@ def main():
     parser.add_argument("--output", default="results/eval_single_turn.json")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--concurrency", type=int, default=5)
+    parser.add_argument(
+        "--variant", type=int, choices=range(4),
+        default=settings.experiment_variant,
+        help="Experiment variant: 0=baseline, 1=agent, 2=harness, 3=combined",
+    )
     args = parser.parse_args()
 
     from orchestrator.single_turn import run_single_task
 
+    variant = get_variant(args.variant)
     tasks = load_tasks(args.data, args.limit)
-    logger.info("Single-turn: Evaluating %d tasks with concurrency=%d", len(tasks), args.concurrency)
+    logger.info(
+        "Single-turn variant %d: requested=(%s, %s), active=(%s, %s)",
+        variant.number,
+        variant.requested_agent_profile,
+        variant.requested_harness_profile,
+        variant.active_agent_profile,
+        variant.active_harness_profile,
+    )
+    logger.info("Evaluating %d tasks with concurrency=%d", len(tasks), args.concurrency)
 
     asyncio.run(run_parallel_evaluation(
         tasks=tasks,
-        run_single_task=run_single_task,
+        run_single_task=partial(run_single_task, variant_number=variant.number),
         output_path=args.output,
         concurrency=args.concurrency,
+        experiment=variant.as_dict(),
     ))
 
 

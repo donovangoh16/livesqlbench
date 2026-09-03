@@ -80,6 +80,12 @@ python -m orchestrator.runner --concurrency 3
 # Run first 10 tasks
 python -m orchestrator.runner --limit 10
 
+# Select an experiment variant (1 and 3 use the four-phase agent prompt)
+python -m orchestrator.runner --variant 0
+python -m orchestrator.runner --variant 1
+python -m orchestrator.runner --variant 2
+python -m orchestrator.runner --variant 3
+
 # Full dataset
 DATASET=full python -m orchestrator.runner --concurrency 3
 ```
