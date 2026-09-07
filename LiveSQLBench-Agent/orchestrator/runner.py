@@ -107,6 +107,44 @@ def load_tasks(data_path: str, limit: int = None) -> List[dict]:
         for line in f:
             if line.strip():
                 tasks.append(json.loads(line))
+
+    # Ground-truth/KG files are evaluation overlays: they may contain only the
+    # instance id, solution SQL, KB ids, and tests. Enrich them from the base
+    # task record while preserving the overlay's evaluation fields.
+    if any("selected_database" not in task or "query" not in task for task in tasks):
+        project_root = Path(__file__).resolve().parent.parent
+        candidates = [
+            Path(settings.data_path),
+            project_root / "livesqlbench-base-lite" / "livesqlbench_data.jsonl",
+            project_root / "livesqlbench-base-full" / "livesqlbench_data.jsonl",
+        ]
+        needed = {task.get("instance_id") for task in tasks}
+        base_records = {}
+        for candidate in dict.fromkeys(candidates):
+            if not candidate.exists() or candidate.resolve() == Path(data_path).resolve():
+                continue
+            with candidate.open() as base_file:
+                for line in base_file:
+                    if not line.strip():
+                        continue
+                    record = json.loads(line)
+                    instance_id = record.get("instance_id")
+                    if instance_id in needed and instance_id not in base_records:
+                        base_records[instance_id] = record
+        tasks = [
+            {**base_records.get(task.get("instance_id"), {}), **task}
+            for task in tasks
+        ]
+
+        missing = [
+            task.get("instance_id") for task in tasks
+            if "selected_database" not in task or "query" not in task
+        ]
+        if missing:
+            raise ValueError(
+                "Could not enrich ground-truth records from a base dataset: "
+                + ", ".join(str(value) for value in missing[:10])
+            )
     if limit:
         tasks = tasks[:limit]
     return tasks

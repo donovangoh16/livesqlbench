@@ -9,6 +9,7 @@ import json
 import logging
 import httpx
 import re
+import hashlib
 from collections import deque
 from difflib import SequenceMatcher
 from typing import Optional
@@ -28,6 +29,7 @@ MAX_JOIN_PATHS = 10
 MAX_SELECTED_TABLES = 8
 MAX_MEANING_CHARS = 180
 MAX_MEANING_HINT_CHARS = 96
+MAX_RESULT_SAMPLE_ROWS = 3
 
 
 def set_current_task_id(task_id: str):
@@ -136,6 +138,82 @@ def _parse_schema(schema: str) -> dict[str, dict]:
             "foreign_keys": foreign_keys,
         }
     return tables
+
+
+def _parse_knowledge(raw, fallback_name: str = "") -> dict:
+    """Normalize the DB environment's sometimes double-encoded KB payload."""
+    value = raw
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError):
+            value = {"definition": value}
+    if not isinstance(value, dict):
+        value = {"definition": str(value)}
+    return {
+        "id": value.get("id"),
+        "name": value.get("knowledge", value.get("name", fallback_name)),
+        "definition": str(value.get("definition", value.get("description", ""))).strip(),
+    }
+
+
+def _knowledge_aliases(name: str) -> set[str]:
+    aliases = {str(name).strip().lower()}
+    aliases.update(value.lower() for value in re.findall(r"\(([A-Z][A-Z0-9]{1,})\)", str(name)))
+    words = re.findall(r"[A-Za-z]+", re.sub(r"\([^)]*\)", "", str(name)))
+    if len(words) > 1:
+        aliases.add("".join(word[0] for word in words).lower())
+    return {alias for alias in aliases if alias}
+
+
+def _rounding_places(value) -> Optional[int]:
+    """Accept integer or compact LLM forms such as '2_decimal_places'."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)) and float(value).is_integer():
+        return int(value)
+    match = re.search(r"\d+", str(value))
+    return int(match.group()) if match else None
+
+
+def _structured_table_result(raw: str, sample_limit: int = MAX_RESULT_SAMPLE_ROWS) -> dict:
+    """Convert the DB environment's pipe table into a compact JSON summary."""
+    text = str(raw).strip()
+    if not text:
+        return {"row_count": 0, "columns": [], "sample_rows": [], "empty": True}
+    if text.lower().startswith(("sql error:", "error calling")):
+        return {"success": False, "error": text[:500]}
+    if "empty result set" in text.lower():
+        return {"row_count": 0, "columns": [], "sample_rows": [], "empty": True}
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    separator = len(lines) >= 2 and set(lines[1]) <= {"-", "+", " ", "|"}
+    if len(lines) < 2 or ("|" not in lines[0] and not separator):
+        return {"row_count": None, "columns": [], "sample_rows": [], "message": text[:500]}
+    columns = [part.strip() for part in lines[0].split("|")]
+    data_lines = lines[2:] if separator else lines[1:]
+    rows = []
+    for line in data_lines:
+        parts = [part.strip() for part in line.split("|")]
+        if len(parts) == len(columns):
+            rows.append(dict(zip(columns, parts)))
+    numeric_ranges = {}
+    for column in columns:
+        values = []
+        for row in rows:
+            try:
+                values.append(float(row[column]))
+            except (TypeError, ValueError):
+                pass
+        if values and len(values) == len(rows):
+            numeric_ranges[column] = [min(values), max(values)]
+    return {
+        "row_count": len(rows),
+        "columns": columns,
+        "sample_rows": rows[:sample_limit],
+        "empty": not rows,
+        "truncated_sample": len(rows) > sample_limit,
+        "numeric_ranges": numeric_ranges,
+    }
 
 
 # ── DB Environment Tools ──
@@ -725,6 +803,7 @@ def prepare_schema_context(
     tool_context: ToolContext,
 ) -> str:
     """Rank tables/columns and find joins in one preprocessing call."""
+    tool_context.state["task_question"] = question
     table_result = json.loads(rank_relevant_tables(
         question, candidate_table_count, tool_context,
     ))
@@ -747,7 +826,22 @@ def prepare_schema_context(
         "disconnected_pairs": join_result.get("disconnected_pairs", []),
     }
     tool_context.state["prepared_schema_context"] = result
-    return json.dumps(result)
+    paths = sorted(
+        result["join_paths"],
+        key=lambda item: (item.get("path_length", 999), item.get("from", ""), item.get("to", "")),
+    )[:5]
+    return json.dumps({
+        "tables": result["tables"],
+        "schema": result["selected_schema"],
+        "ranked_columns": result["columns"],
+        "recommended_join_paths": [
+            {"id": f"jp_{index + 1}", "edges": path.get("edges", []),
+             "bridge_tables": path.get("bridge_tables", [])}
+            for index, path in enumerate(paths)
+        ],
+        "disconnected_pairs": result["disconnected_pairs"],
+        "details_stored": True,
+    }, separators=(",", ":"))
 
 
 def prepare_knowledge_context(
@@ -770,28 +864,81 @@ def prepare_knowledge_context(
 
     definitions = []
     task_id = _get_task_id(tool_context)
-    for name in selected_names:
-        knowledge = _post_json(
+    available_names = _knowledge_names(task_id)
+    alias_to_name = {
+        alias: name for name in available_names for alias in _knowledge_aliases(name)
+    }
+    pending = list(selected_names)
+    seen = set()
+    while pending and len(definitions) < MAX_RANKED_KNOWLEDGE:
+        name = pending.pop(0)
+        if name in seen:
+            continue
+        seen.add(name)
+        raw = _post_json(
             "/knowledge", {"task_id": task_id, "knowledge_name": name}
         ).get("knowledge", "Knowledge not found")
-        definitions.append({"knowledge_name": name, "definition": knowledge})
+        item = _parse_knowledge(raw, name)
+        definition_lower = item["definition"].lower()
+        dependencies = []
+        for alias, dependency_name in alias_to_name.items():
+            if dependency_name != name and re.search(rf"\b{re.escape(alias)}\b", definition_lower):
+                dependencies.append(dependency_name)
+        dependencies = list(dict.fromkeys(dependencies))
+        item["depends_on"] = dependencies
+        definitions.append(item)
+        pending.extend(dependency for dependency in dependencies if dependency not in seen)
+    selected_names = [item["name"] for item in definitions]
+    formula_tokens = {
+        token.lower() for item in definitions
+        for token in re.findall(r"[A-Za-z][A-Za-z0-9_]*", item.get("definition", ""))
+    }
+    required_schema = {}
+    for key in _column_metadata(task_id):
+        parts = str(key).split("|")
+        if len(parts) >= 3 and parts[-1].lower() in formula_tokens:
+            required_schema.setdefault(parts[-2].lower(), []).append(parts[-1].lower())
+    required_schema = {
+        table: sorted(set(columns)) for table, columns in sorted(required_schema.items())
+    }
+    selected_column_set = {str(column).lower() for column in selected_columns}
+    missing_schema_columns = [
+        f"{table}.{column}" for table, columns in required_schema.items() for column in columns
+        if f"{table}.{column}" not in selected_column_set
+    ]
     completeness = json.loads(check_kb_completeness(
         [item.get("phrase", "") for item in required], selected_names, tool_context,
     ))
     result = {
         "required_phrases": [item.get("phrase", "") for item in required],
-        "retrieved_definitions": definitions,
+        "knowledge": definitions,
+        "dependency_order": [item.get("id") for item in reversed(definitions) if item.get("id") is not None],
+        "required_schema": required_schema,
+        "missing_schema_columns": missing_schema_columns,
         "complete": completeness.get("complete", False),
         "missing_phrases": completeness.get("missing_phrases", []),
         "suggested_knowledge": completeness.get("suggested_knowledge", []),
     }
     tool_context.state["prepared_knowledge_context"] = result
-    return json.dumps(result)
+    return json.dumps(result, separators=(",", ":"))
 
 
 def inspect_database(sql: str, tool_context: ToolContext) -> str:
     """Run one small read-only query to resolve preprocessing ambiguity."""
-    return execute_sql(sql, tool_context)
+    raw = execute_sql(sql, tool_context)
+    result = _structured_table_result(raw, sample_limit=50)
+    result.setdefault("success", "error" not in result)
+    if len(result.get("columns", [])) == 1:
+        column = result["columns"][0]
+        result["values"] = [row[column] for row in result.get("sample_rows", [])]
+        result.pop("sample_rows", None)
+    result["selection_rule"] = "exact_match_only_no_inferred_synonyms"
+    inspected_columns = sorted(set(re.findall(
+        r"\b([A-Za-z_]\w*\.[A-Za-z_]\w*)\b", sql.lower()
+    )))
+    result["inspected_columns"] = inspected_columns
+    tool_context.state["last_database_inspection"] = {**result, "sql": sql}
+    return json.dumps(result, separators=(",", ":"))
 
 
 def finalize_preprocessing_context(
@@ -948,11 +1095,17 @@ def finalize_preprocessing_context(
 
         tool_context.state["preprocessing_context"] = context
         tool_context.state["preprocessing_completed"] = True
+        edge_text = "|".join(
+            sorted(f"{edge['left']}={edge['right']}" for edge in normalized_edges)
+        )
         return json.dumps({
             "valid": True,
             "counts": counts,
-            "next_action": "Generate the query plan from stored PREPROCESSING_CONTEXT",
-        })
+            "tables": normalized_tables,
+            "join_path_id": "jp_" + hashlib.sha1(edge_text.encode()).hexdigest()[:8],
+            "kb_ids": [item.get("id") for item in normalized_knowledge if item.get("id") is not None],
+            "next": "generate_plan",
+        }, separators=(",", ":"))
     except Exception as exc:
         tool_context.state["preprocessing_completed"] = False
         return json.dumps({
@@ -989,6 +1142,7 @@ def _normalize_plan(plan: dict, category: str) -> tuple[dict, list[str]]:
         "filters": "conditions",
         "group_by": "grouping",
         "order_by": "ordering",
+        "where": "global_filters",
     }
     for alternate, canonical in field_aliases.items():
         if canonical not in normalized and alternate in normalized:
@@ -1035,6 +1189,66 @@ def _normalize_plan(plan: dict, category: str) -> tuple[dict, list[str]]:
         })
     normalized["joins"] = joins
 
+    outputs = []
+    moved_output_filters = []
+    for value in normalized.get("output_columns") or []:
+        if not isinstance(value, dict):
+            expression = str(value)
+            outputs.append({
+                "name": expression.split(".")[-1],
+                "expression": expression,
+                "expose": True,
+            })
+            continue
+        item = dict(value)
+        if "filter" not in item and "condition" in item:
+            item["filter"] = item["condition"]
+        if "knowledge_id" not in item and item.get("knowledge_ids"):
+            item["knowledge_id"] = item["knowledge_ids"][0]
+        item.setdefault("expose", True)
+        scale = str(item.get("scale", ""))
+        if "rounding" in item:
+            normalized_rounding = _rounding_places(item["rounding"])
+            if normalized_rounding is not None:
+                item["rounding"] = normalized_rounding
+                changes.append("output rounding normalized")
+        else:
+            rounding = re.search(r"(?:round(?:ed)?(?:\s+to)?|decimal(?:\s+places?)?)\D*(\d+)", scale, re.I)
+            if rounding:
+                item["rounding"] = int(rounding.group(1))
+        expression = str(item.get("expression", ""))
+        aggregate = str(item.get("aggregate", ""))
+        is_aggregate = bool(aggregate or re.search(
+            r"\b(count|sum|avg|min|max|percentile_cont|percentile_disc)\s*\(",
+            expression, re.I,
+        ))
+        if item.get("filter") and not is_aggregate:
+            moved_output_filters.append({
+                "expression": item.pop("filter"), "stage": "WHERE",
+                "phrase": f"restriction for {item.get('name', 'output')}",
+            })
+        outputs.append(item)
+    normalized["output_columns"] = outputs
+
+    if normalized.get("global_filters") and not normalized.get("conditions"):
+        normalized["conditions"] = [
+            {"expression": value, "stage": "WHERE"}
+            if isinstance(value, str) else value
+            for value in normalized["global_filters"]
+        ]
+    if "population_constraints" not in normalized:
+        alternatives = normalized.get("entity_filters") or normalized.get("row_filters")
+        if alternatives is None:
+            alternatives = normalized.get("global_filters")
+        if alternatives is not None:
+            normalized["population_constraints"] = [
+                {"phrase": "global restriction", "predicate": value}
+                if isinstance(value, str) else value
+                for value in alternatives
+            ]
+        else:
+            normalized["population_constraints"] = []
+
     for field in ("calculations", "conditions"):
         items = []
         for value in normalized.get(field) or []:
@@ -1044,10 +1258,42 @@ def _normalize_plan(plan: dict, category: str) -> tuple[dict, list[str]]:
             item = dict(value)
             if "knowledge_id" not in item and "kb_id" in item:
                 item["knowledge_id"] = item["kb_id"]
-            if field == "conditions" and "expression" not in item and "predicate" in item:
-                item["expression"] = item["predicate"]
+            if "knowledge_id" not in item and item.get("knowledge_ids"):
+                item["knowledge_id"] = item["knowledge_ids"][0]
+            if field == "conditions" and "expression" not in item:
+                item["expression"] = item.get("predicate", item.get("condition", item.get("filter", "")))
+            if field == "conditions" and not item.get("stage"):
+                item["stage"] = (
+                    "HAVING" if re.search(
+                        r"\b(count|sum|avg|min|max|percentile_cont|percentile_disc)\s*\(",
+                        str(item.get("expression", "")), re.I,
+                    ) else "WHERE"
+                )
             items.append(item)
         normalized[field] = items
+
+    if moved_output_filters:
+        normalized.setdefault("conditions", []).extend(moved_output_filters)
+        normalized.setdefault("population_constraints", []).extend({
+            "phrase": item["phrase"], "predicate": item["expression"]
+        } for item in moved_output_filters)
+        changes.append("non-aggregate output filters moved to WHERE")
+
+    for calculation in normalized.get("calculations") or []:
+        if isinstance(calculation, dict):
+            calculation.setdefault("expose", False)
+
+    if not normalized.get("steps"):
+        steps = ["read grounded sources and apply joins"]
+        if normalized.get("conditions") or normalized.get("population_constraints"):
+            steps.append("apply row and group restrictions")
+        if normalized.get("calculations"):
+            steps.append("compute KB-backed expressions")
+        steps.append("project the exact output contract")
+        if normalized.get("ordering") or normalized.get("limit"):
+            steps.append("apply ordering and limit")
+        normalized["steps"] = steps
+        changes.append("ordered steps generated")
 
     if category == "Query" and str(normalized.get("operation", "")).upper() != "SELECT":
         normalized["operation"] = "SELECT"
@@ -1077,6 +1323,173 @@ def _derive_plan_difficulty(category: str, plan: dict) -> str:
     if procedural or multi_object or multi_statement:
         return "nested_complex"
     return "non_nested_complex" if relational else "easy"
+
+
+def _generation_strategy(category: str, difficulty: str) -> dict:
+    strategies = {
+        ("Query", "easy"): {
+            "shape": "single_select",
+            "checks": ["one_table", "exact_outputs", "filters"],
+        },
+        ("Query", "non_nested_complex"): {
+            "shape": "joined_select",
+            "checks": ["fk_join_path", "result_grain", "filter_stage", "exact_outputs"],
+        },
+        ("Query", "nested_complex"): {
+            "shape": "staged_cte_pipeline",
+            "stages": ["base_population", "component_metrics", "combined_metrics", "final_projection"],
+            "checks": ["key_preservation", "grain_per_stage", "dependency_order",
+                       "no_row_multiplication", "exact_outputs"],
+        },
+        ("Management", "easy"): {
+            "shape": "single_statement",
+            "checks": ["target", "operation", "affected_rows"],
+        },
+        ("Management", "non_nested_complex"): {
+            "shape": "source_then_mutation",
+            "checks": ["source_target_join", "deduplication", "affected_rows"],
+        },
+        ("Management", "nested_complex"): {
+            "shape": "ordered_statement_pipeline",
+            "checks": ["statement_order", "object_dependencies", "predicate_scope", "definitions"],
+        },
+    }
+    return strategies[(category, difficulty)]
+
+
+def _compact_plan_contract(plan: dict) -> dict:
+    expressions = [
+        str(item.get("expression", ""))
+        for field in ("calculations", "output_columns")
+        for item in (plan.get(field) or []) if isinstance(item, dict)
+    ]
+    knowledge_ids = list(dict.fromkeys(
+        item.get("knowledge_id", item.get("kb_id"))
+        for field in ("calculations", "conditions", "output_columns")
+        for item in (plan.get(field) or []) if isinstance(item, dict)
+        if item.get("knowledge_id", item.get("kb_id")) is not None
+    ))
+    dependencies = list(dict.fromkeys(
+        str(dependency)
+        for field in ("calculations", "output_columns")
+        for item in (plan.get(field) or []) if isinstance(item, dict)
+        for dependency in (item.get("formula_dependencies") or [])
+    ))
+    edge_text = "|".join(sorted(
+        f"{item.get('left', '')}={item.get('right', '')}"
+        for item in (plan.get("joins") or []) if isinstance(item, dict)
+    ))
+    return {
+        "output_count": len(plan.get("output_columns") or []),
+        "knowledge_ids": knowledge_ids,
+        "formula_dependencies": dependencies,
+        "population": [
+            item.get("predicate", item.get("expression", ""))
+            for item in (plan.get("population_constraints") or []) if isinstance(item, dict)
+        ],
+        "join_path_id": "jp_" + hashlib.sha1(edge_text.encode()).hexdigest()[:8],
+        "decimal_divisors": list(dict.fromkeys(
+            re.findall(r"/\s*(\d+\.\d+)", " ".join(expressions))
+        )),
+    }
+
+
+def _transitive_kb_ids(direct_ids: set[str], tool_context: ToolContext) -> set[str]:
+    knowledge = tool_context.state.get("prepared_knowledge_context", {}).get("knowledge", [])
+    name_to_item = {str(item.get("name", "")): item for item in knowledge}
+    id_to_item = {
+        str(item.get("id")): item for item in knowledge if item.get("id") is not None
+    }
+    used = set(direct_ids)
+    pending = list(direct_ids)
+    while pending:
+        item = id_to_item.get(pending.pop())
+        if not item:
+            continue
+        for dependency_name in item.get("depends_on", []) or []:
+            dependency = name_to_item.get(str(dependency_name))
+            if dependency and dependency.get("id") is not None:
+                dependency_id = str(dependency["id"])
+                if dependency_id not in used:
+                    used.add(dependency_id)
+                    pending.append(dependency_id)
+    return used
+
+
+def _semantic_plan_contract(
+    category: str, difficulty: str, plan: dict, context: dict, tool_context: ToolContext
+) -> dict:
+    question = str(tool_context.state.get("task_question", ""))
+    outputs = [
+        str(item.get("name", item.get("expression", "output")))
+        if isinstance(item, dict) else str(item)
+        for item in (plan.get("output_columns") or [])
+        if not isinstance(item, dict) or item.get("expose", True)
+    ]
+    populations = [
+        str(item.get("predicate", item.get("expression", "")))
+        for item in (plan.get("population_constraints") or []) if isinstance(item, dict)
+    ]
+    joins = [
+        f"{item.get('left', '')}={item.get('right', '')}"
+        for item in (plan.get("joins") or []) if isinstance(item, dict)
+    ]
+    direct_kb = {
+        str(item.get("knowledge_id", item.get("kb_id")))
+        for field in ("calculations", "conditions", "output_columns")
+        for item in (plan.get(field) or []) if isinstance(item, dict)
+        if item.get("knowledge_id", item.get("kb_id")) is not None
+    }
+    used_kb = _transitive_kb_ids(direct_kb, tool_context)
+    selected_kb = {
+        str(item.get("id")) for item in context.get("selected_knowledge", [])
+        if item.get("id") is not None
+    }
+    selected_edges = {
+        frozenset((str(item.get("left", "")).lower(), str(item.get("right", "")).lower()))
+        for item in context.get("selected_join_edges", [])
+    }
+    categorical_grounded = all(
+        not re.findall(r"'([^']+)'", predicate)
+        or item.get("value_verified") is True
+        for item, predicate in (
+            (item, str(item.get("predicate", item.get("expression", ""))))
+            for item in (plan.get("population_constraints") or []) if isinstance(item, dict)
+        )
+    )
+    ordering_requested = bool(re.search(r"\b(sort|order|highest|lowest|ascending|descending)\b", question, re.I))
+    checks = {
+        "population_grounded": all(populations) and categorical_grounded
+        if plan.get("population_constraints") else True,
+        "outputs_defined": bool(outputs) if category == "Query" else bool(plan.get("target_objects")),
+        "kb_dependencies_complete": selected_kb.issubset(used_kb),
+        "join_path_grounded": all(
+            frozenset((str(item.get("left", "")).lower(), str(item.get("right", "")).lower()))
+            in selected_edges for item in (plan.get("joins") or []) if isinstance(item, dict)
+        ),
+        "filter_stages_defined": all(
+            isinstance(item, dict) and bool(item.get("expression")) and bool(item.get("stage"))
+            for item in (plan.get("conditions") or [])
+        ),
+        "ordering_covered": not ordering_requested or bool(plan.get("ordering")),
+    }
+    summary_parts = [f"{category}/{difficulty}"]
+    if plan.get("result_grain"):
+        summary_parts.append("grain=" + str(plan["result_grain"])[:80])
+    summary_parts.append("population=" + (", ".join(value[:100] for value in populations) or "all rows"))
+    summary_parts.append("outputs=" + (", ".join(outputs[:12]) or "none"))
+    if joins:
+        summary_parts.append("joins=" + ", ".join(joins[:5]))
+    if selected_kb:
+        summary_parts.append("KB=" + ",".join(sorted(selected_kb)))
+    if plan.get("ordering"):
+        summary_parts.append("ordered=yes")
+    return {
+        "summary": "; ".join(summary_parts)[:700],
+        "checks": checks,
+        "semantic_valid": all(checks.values()),
+        "next": "review_summary_then_generate_sql" if all(checks.values()) else "regenerate_plan",
+    }
 
 
 def generate_query_plan(
@@ -1182,10 +1595,11 @@ def validate_query_plan(tool_context: ToolContext) -> str:
     }
     used_knowledge_ids = {
         str(item.get("knowledge_id", item.get("kb_id")))
-        for field in ("calculations", "conditions")
+        for field in ("calculations", "conditions", "output_columns")
         for item in (plan.get(field) or []) if isinstance(item, dict)
         if item.get("knowledge_id", item.get("kb_id")) is not None
     }
+    used_knowledge_ids = _transitive_kb_ids(used_knowledge_ids, tool_context)
     for knowledge_id in sorted(selected_knowledge_ids - used_knowledge_ids):
         errors.append(f"Required knowledge ID is not used by a calculation or condition: {knowledge_id}")
 
@@ -1218,6 +1632,72 @@ def validate_query_plan(tool_context: ToolContext) -> str:
             errors.append(f"Condition requires an expression: {condition}")
         if not condition.get("stage"):
             errors.append(f"Condition requires an application stage: {condition}")
+
+    if category == "Query" and "population_constraints" not in plan:
+        errors.append("Query plan must explicitly provide population_constraints (use [] when none)")
+    for constraint in plan.get("population_constraints", []) or []:
+        if not isinstance(constraint, dict):
+            errors.append(f"Population constraint must be an object: {constraint}")
+            continue
+        if not constraint.get("phrase"):
+            errors.append(f"Population constraint requires source phrase: {constraint}")
+        predicate = str(constraint.get("predicate", constraint.get("expression", "")))
+        if not predicate:
+            errors.append(f"Population constraint requires predicate: {constraint}")
+            continue
+        refs = set(re.findall(r"\b([a-zA-Z_]\w*\.[a-zA-Z_]\w*)\b", predicate.lower()))
+        for ref in refs:
+            if ref not in selected_columns:
+                errors.append(f"Population constraint column is not selected: {ref}")
+        literals = re.findall(r"'([^']+)'", predicate)
+        if literals:
+            inspection = tool_context.state.get("last_database_inspection", {})
+            observed_values = {
+                str(value).lower() for value in inspection.get("values", [])
+            }
+            for row in inspection.get("sample_rows", []) or []:
+                observed_values.update(str(value).lower() for value in row.values())
+            if constraint.get("value_verified") is not True:
+                errors.append(
+                    f"Categorical constraint requires value_verified=true: {constraint.get('phrase', '')}"
+                )
+            unobserved = [value for value in literals if value.lower() not in observed_values]
+            if unobserved:
+                errors.append(
+                    f"Categorical values were not observed by inspect_database: {unobserved}"
+                )
+            phrase_tokens = {
+                token[:-1] if token.endswith("s") else token
+                for token in re.findall(r"[a-z0-9]+", str(constraint.get("phrase", "")).lower())
+            }
+            directly_named = {
+                value for value in observed_values
+                if any(
+                    (token[:-1] if token.endswith("s") else token) in phrase_tokens
+                    for token in re.findall(r"[a-z0-9]+", value)
+                )
+            }
+            unsupported = [
+                value for value in literals
+                if directly_named and value.lower() not in directly_named
+                and not constraint.get("equivalence_reason")
+            ]
+            if unsupported:
+                errors.append(
+                    "Categorical values are broader than the request's exact wording: "
+                    f"{unsupported}; add equivalence_reason only when the request or KB equates them"
+                )
+
+    for output in plan.get("output_columns", []) or []:
+        if not isinstance(output, dict) or not output.get("filter"):
+            continue
+        expression = str(output.get("expression", ""))
+        aggregate = str(output.get("aggregate", ""))
+        if not aggregate and not re.search(
+            r"\b(count|sum|avg|min|max|percentile_cont|percentile_disc)\s*\(",
+            expression, re.I,
+        ):
+            errors.append(f"Output filter requires an aggregate output: {output.get('name', output)}")
 
     referenced_columns = []
     for field in ("output_columns", "target_objects"):
@@ -1259,6 +1739,13 @@ def validate_query_plan(tool_context: ToolContext) -> str:
         )
         candidate["difficulty"] = derived_difficulty
 
+    semantic_contract = _semantic_plan_contract(
+        category, derived_difficulty, plan, context, tool_context,
+    )
+    for check, passed in semantic_contract["checks"].items():
+        if not passed:
+            errors.append(f"Semantic plan check failed: {check}")
+
     if errors:
         result = {
             "valid": False,
@@ -1267,14 +1754,9 @@ def validate_query_plan(tool_context: ToolContext) -> str:
             "difficulty": derived_difficulty,
             "errors": errors,
             "warnings": warnings,
-            "recommendation": "Fix every error and call generate_query_plan again",
-            "expected_shape": {
-                "source_tables": ["physical_table"],
-                "joins": [{
-                    "left": "table.column", "right": "table.column", "type": "INNER",
-                }],
-                "conditions": [{"expression": "predicate", "stage": "WHERE"}],
-            },
+            "semantic_contract": semantic_contract,
+            "recommendation": "Fix errors; call generate_query_plan again",
+            "next": "fix_errors_then_regenerate_plan",
         }
         tool_context.state["query_plan_validation"] = result
         tool_context.state["query_plan_validated"] = False
@@ -1294,7 +1776,10 @@ def validate_query_plan(tool_context: ToolContext) -> str:
         "difficulty": derived_difficulty,
         "errors": [],
         "warnings": warnings,
-        "next_action": "Proceed to SQL generation using QUERY_PLAN",
+        "contract": _compact_plan_contract(plan),
+        "semantic_contract": semantic_contract,
+        "generation_strategy": _generation_strategy(category, derived_difficulty),
+        "next": "generate_sql",
     }
     tool_context.state["query_plan"] = official_plan
     tool_context.state["query_plan_validation"] = result
@@ -1329,9 +1814,10 @@ def validate_sql_to_plan(
     def add_diagnosis(kind: str, message: str, component: str, change: str):
         diagnoses.append({
             "type": kind,
+            "code": kind.upper(),
             "message": message,
-            "plan_component": component,
-            "recommended_change": change,
+            "path": component,
+            "action": change,
         })
 
     if not tool_context.state.get("query_plan_validated", False) or not official:
@@ -1466,6 +1952,60 @@ def validate_sql_to_plan(
                         "output_columns",
                         f"Include the planned output column {output} in the projection.",
                     )
+        exposed_outputs = [
+            output for output in (plan.get("output_columns") or [])
+            if not isinstance(output, dict) or output.get("expose", True)
+        ]
+        outer_selects = [
+            tree if isinstance(tree, exp.Select) else tree.find(exp.Select)
+            for tree in trees
+        ]
+        actual_projections = [
+            projection for select in outer_selects if select is not None
+            for projection in select.expressions
+        ]
+        if category == "Query" and len(actual_projections) != len(exposed_outputs):
+            add_diagnosis(
+                "output_count_mismatch",
+                f"The output contract exposes {len(exposed_outputs)} columns, but SQL projects {len(actual_projections)}.",
+                "output_columns",
+                "Project exactly the exposed outputs; keep intermediate calculations inside CTEs/subqueries.",
+            )
+        for index, output in enumerate(exposed_outputs[:len(actual_projections)]):
+            if not isinstance(output, dict):
+                continue
+            projection_sql = actual_projections[index].sql(dialect="postgres").lower()
+            raw_rounding = output.get("rounding")
+            rounding = _rounding_places(raw_rounding)
+            if raw_rounding is not None and rounding is None:
+                add_diagnosis(
+                    "invalid_rounding_contract",
+                    f"Output {index + 1} has unsupported rounding value {raw_rounding!r}.",
+                    f"output_columns[{index}].rounding",
+                    "Use an integer number of decimal places.",
+                )
+            elif rounding is not None and not re.search(
+                rf"\bround\s*\(.*?,\s*{rounding}\s*\)", projection_sql, re.I,
+            ):
+                add_diagnosis(
+                    "output_rounding_mismatch",
+                    f"Output {index + 1} requires rounding to {rounding} decimals.",
+                    f"output_columns[{index}].rounding",
+                    f"Apply ROUND(expression, {rounding}) to this output.",
+                )
+            scale = str(output.get("scale", "")).lower().replace("-", "_").replace(" ", "_")
+            if "percent_rank" in projection_sql:
+                multiplied_by_100 = bool(re.search(r"percent_rank\s*\(\).*?\*\s*100(?:\.0+)?", projection_sql))
+                if scale in {"0_to_1", "ratio", "fraction"} and multiplied_by_100:
+                    add_diagnosis(
+                        "output_scale_mismatch", "PERCENT_RANK must remain on a 0-to-1 scale.",
+                        f"output_columns[{index}].scale", "Remove multiplication by 100.",
+                    )
+                if scale in {"0_to_100", "percentage", "percent"} and not multiplied_by_100:
+                    add_diagnosis(
+                        "output_scale_mismatch", "PERCENT_RANK must be converted to a 0-to-100 scale.",
+                        f"output_columns[{index}].scale", "Multiply PERCENT_RANK by 100.",
+                    )
         for target in plan.get("target_objects", []) or []:
             target_text = str(target).lower()
             if target_text not in sql_lower and target_text.split(".")[-1] not in sql_lower:
@@ -1476,7 +2016,7 @@ def validate_sql_to_plan(
                     f"Include the planned target object {target}.",
                 )
 
-        for field in ("calculations", "conditions"):
+        for field in ("calculations", "conditions", "output_columns"):
             for item in plan.get(field, []) or []:
                 if not isinstance(item, dict) or item.get("knowledge_id") is None:
                     continue
@@ -1493,6 +2033,63 @@ def validate_sql_to_plan(
                         "Implement the complete knowledge-backed expression from QUERY_PLAN.",
                     )
 
+        filtered_outputs = [
+            output for output in plan.get("output_columns", []) or []
+            if isinstance(output, dict) and output.get("filter")
+        ]
+        if filtered_outputs:
+            has_local_filter = any(
+                tree.find(exp.Filter) is not None or tree.find(exp.Case) is not None
+                for tree in trees
+            )
+            if not has_local_filter:
+                add_diagnosis(
+                    "output_filter_scope_mismatch",
+                    "A filtered output was implemented without FILTER or CASE.",
+                    "output_columns.filter",
+                    "Apply the condition inside only the named aggregate output.",
+                )
+
+        population_constraints = plan.get("population_constraints", []) or []
+        where_sql = " ".join(
+            where.sql(dialect="postgres").lower()
+            for tree in trees for where in tree.find_all(exp.Where)
+        )
+        calculation_expressions = {
+            str(item.get("name", "")).lower(): str(item.get("expression", "")).lower()
+            for item in (plan.get("calculations") or []) if isinstance(item, dict)
+            and item.get("name") and item.get("expression")
+        }
+        for constraint in population_constraints:
+            if not isinstance(constraint, dict):
+                continue
+            predicate = str(constraint.get("predicate", constraint.get("expression", ""))).lower()
+            expanded_predicate = predicate
+            for name, expression in calculation_expressions.items():
+                expanded_predicate = re.sub(
+                    rf"\b{re.escape(name)}\b", f"({expression})", expanded_predicate,
+                )
+            required = set(re.findall(
+                r"\b[a-zA-Z_]\w*\b|'[^']*'|\b\d+(?:\.\d+)?\b", expanded_predicate
+            ))
+            required -= planned_tables | {
+                "and", "or", "not", "is", "null", "true", "false", "numeric",
+                "decimal", "double", "precision", "round", "cast",
+            }
+            missing = sorted(token for token in required if token.strip("'") not in where_sql)
+            if missing:
+                add_diagnosis(
+                    "population_constraint_missing",
+                    f"Population restriction '{constraint.get('phrase', '')}' is missing from WHERE.",
+                    "population_constraints",
+                    "Add the grounded population predicate without applying it only to one output.",
+                )
+                diagnoses[-1].update({
+                    "expected_predicate": expanded_predicate[:500],
+                    "missing_tokens": missing,
+                    "observed_where": where_sql[:500],
+                })
+
 
     history = list(tool_context.state.get("sql_validation_history", []))
     sql_version = len(history) + 1
@@ -1508,13 +2105,25 @@ def validate_sql_to_plan(
     tool_context.state["sql_generation_completed"] = not diagnoses
 
     if diagnoses:
+        signature = tuple(sorted(
+            (item.get("code", item.get("type", "")), item.get("path", ""))
+            for item in diagnoses
+        ))
+        same_diagnosis_count = 1 + sum(
+            tuple(sorted(
+                (item.get("code", item.get("type", "")), item.get("path", item.get("plan_component", "")))
+                for item in record.get("diagnoses", [])
+            )) == signature
+            for record in history[:-1]
+        )
         return json.dumps({
             "valid": False,
             "sql_version": sql_version,
             "plan_version": plan_version,
             "diagnoses": diagnoses,
-            "recommendation": "Revise the SQL using every diagnosis and call validate_sql_to_plan again",
-        })
+            "same_diagnosis_count": same_diagnosis_count,
+            "next": "revise_plan" if same_diagnosis_count >= 2 else "revise_sql",
+        }, separators=(",", ":"))
 
     tool_context.state["draft_sql"] = sql
     tool_context.state["draft_sql_version"] = sql_version
@@ -1530,7 +2139,7 @@ def validate_sql_to_plan(
             if category == "Query"
             else "Perform final checks, then call submit_validated_sql"
         ),
-    })
+    }, separators=(",", ":"))
 
 
 # ── Improved Post-processing Tool (variants 1 and 3) ──
@@ -1632,7 +2241,7 @@ def diagnose_execution_error(
 
 
 def execute_validated_sql(tool_context: ToolContext) -> str:
-    """Execute the latest SQL that passed validate_sql_to_plan."""
+    """Execute a bounded preview of the latest validated Query SQL."""
     sql = tool_context.state.get("draft_sql")
     if not sql or not tool_context.state.get("sql_generation_completed", False):
         return json.dumps({
@@ -1640,12 +2249,47 @@ def execute_validated_sql(tool_context: ToolContext) -> str:
             "error": "No validated DRAFT_SQL is available",
             "next_action": "Call validate_sql_to_plan first",
         })
-    result = execute_sql(sql, tool_context)
+    preview_sql = (
+        "SELECT * FROM (\n" + str(sql).strip().rstrip(";")
+        + "\n) AS _candidate_preview LIMIT 3;"
+    )
+    result = execute_sql(preview_sql, tool_context)
     tool_context.state["last_execution_sql"] = sql
     tool_context.state["last_execution_result"] = result
     succeeded = not str(result).lower().startswith(("sql error:", "error calling"))
     tool_context.state["last_execution_succeeded"] = succeeded
-    return json.dumps({"success": succeeded, "result": str(result)[:1200]})
+    if not succeeded:
+        return json.dumps({"success": False, "error": str(result)[:500]}, separators=(",", ":"))
+    summary = _structured_table_result(result)
+    summary["success"] = True
+    summary["sample_row_count"] = summary.pop("row_count", None)
+    summary["has_rows"] = not summary.get("empty", False)
+    alerts = []
+    plan = (tool_context.state.get("query_plan") or {}).get("plan", {})
+    ranges = summary.get("numeric_ranges", {})
+    for output in plan.get("output_columns", []) or []:
+        if not isinstance(output, dict) or not output.get("expected_range"):
+            continue
+        name = str(output.get("name", ""))
+        expected = output.get("expected_range")
+        observed = ranges.get(name)
+        if observed and isinstance(expected, (list, tuple)) and len(expected) == 2:
+            if observed[0] < expected[0] or observed[1] > expected[1]:
+                alerts.append({
+                    "code": "VALUE_OUTSIDE_EXPECTED_RANGE",
+                    "column": name,
+                    "expected": list(expected),
+                    "observed": observed,
+                })
+    if alerts:
+        summary["alerts"] = alerts
+        summary["next"] = "semantic_review"
+    elif summary.get("empty"):
+        summary["next"] = "semantic_review"
+    else:
+        summary["next"] = "submit"
+    tool_context.state["last_execution_summary"] = summary
+    return json.dumps(summary, separators=(",", ":"))
 
 
 def diagnose_last_execution_error(tool_context: ToolContext) -> str:

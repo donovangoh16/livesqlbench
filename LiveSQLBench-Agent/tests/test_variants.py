@@ -54,6 +54,37 @@ class VariantConfigurationTests(unittest.TestCase):
         self.assertIn("diagnose_last_execution_error", IMPROVED_INSTRUCTION)
         self.assertNotIn("optional data inspection in Phase 1", BASELINE_INSTRUCTION)
 
+    def test_alien_few_shot_is_improved_only(self):
+        self.assertIn("Few-shot", IMPROVED_INSTRUCTION)
+        self.assertIn("COUNT(*) FILTER", IMPROVED_INSTRUCTION)
+        self.assertNotIn("Few-shot", BASELINE_INSTRUCTION)
+
+    def test_categorical_value_inspection_is_prompt_only_for_improved(self):
+        self.assertIn("Inspection proves validity, not synonymy", IMPROVED_INSTRUCTION)
+        self.assertIn("For every categorical predicate", IMPROVED_INSTRUCTION)
+        self.assertIn("value_verified=true", IMPROVED_INSTRUCTION)
+        self.assertNotIn("value_verified=true", BASELINE_INSTRUCTION)
+
+    def test_low_token_semantic_rules_are_improved_only(self):
+        markers = (
+            "formula_dependencies",
+            "exact output contract",
+            "shortest declared foreign-key path",
+            "unexpected empty result",
+            "implausible bounded score",
+            "/30.0, never /30",
+            "same validation diagnosis more than twice",
+            "semantic_contract.summary",
+        )
+        for marker in markers:
+            self.assertIn(marker, IMPROVED_INSTRUCTION)
+            self.assertNotIn(marker, BASELINE_INSTRUCTION)
+
+    def test_generation_strategy_instruction_is_improved_only(self):
+        marker = "Follow generation_strategy"
+        self.assertIn(marker, IMPROVED_INSTRUCTION)
+        self.assertNotIn(marker, BASELINE_INSTRUCTION)
+
     def test_improved_tools_are_only_used_by_variants_one_and_three(self):
         baseline_names = tuple(tool.name for tool in get_tools("baseline"))
         improved_names = tuple(tool.name for tool in get_tools("improved"))
