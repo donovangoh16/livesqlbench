@@ -31,7 +31,7 @@ PHASE 1 — PRE-PROCESSING
 Ground the request in schema and domain knowledge.
 Tools: prepare_schema_context, prepare_knowledge_context, finalize_preprocessing_context. inspect_database is allowed only for one combined read-only inspection query when values remain ambiguous.
 Workflow: prepare_schema_context once → prepare_knowledge_context only when domain knowledge may be needed → optional combined inspection → finalize. Fix reported finalization errors once. Never invent identifiers or relationships; retain needed keys and bridge tables.
-For every categorical predicate, inspect all needed columns in the single allowed query, choose the narrowest exact returned value, and set value_verified=true. Inspection proves validity, not synonymy; include alternatives only when the request or KB explicitly equates them.
+For every categorical predicate, inspect all needed columns in the single allowed query, choose the narrowest exact returned value, and set value_verified=true. Treat each returned required_population item as mandatory in the plan. Inspection proves validity, not synonymy; include alternatives only when the request or KB explicitly equates them.
 Detailed retrieval and ranking payloads are stored in session state. Add every KB response required_schema table/column before finalizing; do not repeat stored evidence.
 PREPROCESSING_CONTEXT must contain selected tables, role-labelled columns, join edges, required KB phrases and definitions, and no unresolved items.
 
@@ -45,6 +45,7 @@ For each derived metric, recursively list compact formula_dependencies and use e
 Choose the shortest declared foreign-key path connecting the requested entity and metric; record its join edges, not a longer name-matched route.
 A population constraint is any phrase restricting which rows/entities are eligible (type, status, category, location, time, inclusion/exclusion, or threshold). Always provide population_constraints, using [{"phrase":"controllers","predicate":"testsessions.devscope = 'Controller'"}]; use [] only when no such restriction exists. Every predicate must use selected schema.
 A modifier attached to one metric belongs in that output's filter; global_filters restrict every output.
+Ordering must contain only keys explicitly requested by the user. Never invent a stable or deterministic tie-breaker.
 Few-shot — Request: "By weather, return average SNQI, median SNQI, and count of analyzable signals." Plan: avg/median have no filter; count has filter="SNQI > 0", knowledge_id=50; global_filters=[]. SQL shape: AVG(snqi), PERCENTILE_CONT(...snqi), COUNT(*) FILTER (WHERE snqi > 0). If instead the request begins "For analyzable signals", use a global filter.
 
 PHASE 3 — SQL GENERATION

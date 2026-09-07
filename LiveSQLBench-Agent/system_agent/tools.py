@@ -10,6 +10,7 @@ import logging
 import httpx
 import re
 import hashlib
+import ast
 from collections import deque
 from difflib import SequenceMatcher
 from typing import Optional
@@ -174,6 +175,138 @@ def _rounding_places(value) -> Optional[int]:
         return int(value)
     match = re.search(r"\d+", str(value))
     return int(match.group()) if match else None
+
+
+def _singular_token(token: str) -> str:
+    irregular = {
+        "mice": "mouse", "men": "man", "women": "woman", "children": "child",
+        "people": "person", "teeth": "tooth", "feet": "foot",
+    }
+    value = str(token).lower()
+    if value in irregular:
+        return irregular[value]
+    if value.endswith("ies") and len(value) > 3:
+        return value[:-3] + "y"
+    if value.endswith("s") and not value.endswith("ss"):
+        return value[:-1]
+    return value
+
+
+def _required_population_from_inspection(question: str, evidence: dict) -> list[dict]:
+    """Find inspected categorical values explicitly named by the request."""
+    question_tokens = {
+        _singular_token(token)
+        for token in re.findall(r"[a-z0-9]+", str(question).lower())
+        if len(token) > 1
+    }
+    requirements = []
+    for column, values in sorted(evidence.items()):
+        for value in values:
+            if not isinstance(value, str):
+                continue
+            value_tokens = {
+                _singular_token(token)
+                for token in re.findall(r"[a-z0-9]+", value.lower())
+                if len(token) > 1
+            }
+            if value_tokens and value_tokens.issubset(question_tokens):
+                requirements.append({
+                    "phrase": value,
+                    "column": column,
+                    "value": value,
+                    "value_verified": True,
+                })
+    return requirements
+
+
+def _inspection_column_keys(sql: str) -> list[str]:
+    """Resolve inspected columns to physical table.column keys when possible."""
+    try:
+        from sqlglot import exp, parse_one
+        tree = parse_one(sql, dialect="postgres")
+        aliases = {
+            (table.alias_or_name or table.name).lower(): table.name.lower()
+            for table in tree.find_all(exp.Table) if table.name
+        }
+        only_table = next(iter(set(aliases.values()))) if len(set(aliases.values())) == 1 else ""
+        keys = []
+        for column in tree.find_all(exp.Column):
+            table = aliases.get(str(column.table).lower(), str(column.table).lower())
+            if not table:
+                table = only_table
+            if table and column.name:
+                keys.append(f"{table}.{column.name.lower()}")
+        return list(dict.fromkeys(keys))
+    except Exception:
+        return sorted(set(re.findall(
+            r"\b([A-Za-z_]\w*\.[A-Za-z_]\w*)\b", str(sql).lower()
+        )))
+
+
+def _atomic_inspection_values(value) -> list[str]:
+    """Flatten list/array cells returned by aggregate inspection queries."""
+    if value is None or str(value).strip().lower() in {"", "none", "null"}:
+        return []
+    parsed = value
+    if isinstance(value, str):
+        text = value.strip()
+        try:
+            if (text.startswith("[") and text.endswith("]")) or (
+                text.startswith("(") and text.endswith(")")
+            ):
+                parsed = ast.literal_eval(text)
+            elif text.startswith("{") and text.endswith("}"):
+                parsed = [item.strip().strip('"') for item in text[1:-1].split(",")]
+        except (SyntaxError, ValueError):
+            parsed = value
+    if isinstance(parsed, (list, tuple, set)):
+        return [
+            atom for item in parsed for atom in _atomic_inspection_values(item)
+        ]
+    return [str(parsed)]
+
+
+def _inspection_alias_sources(sql: str) -> dict[str, list[str]]:
+    """Map each inspection output alias to physical source columns."""
+    try:
+        from sqlglot import exp, parse_one
+        tree = parse_one(sql, dialect="postgres")
+        mapping = {}
+        global_tables = list(tree.find_all(exp.Table))
+        global_aliases = {
+            (table.alias_or_name or table.name).lower(): table.name.lower()
+            for table in global_tables if table.name
+        }
+        global_only_table = (
+            next(iter(set(global_aliases.values())))
+            if len(set(global_aliases.values())) == 1 else ""
+        )
+        for projection in tree.expressions:
+            alias = str(projection.alias_or_name or "").lower()
+            expression = projection.this if isinstance(projection, exp.Alias) else projection
+            tables = list(expression.find_all(exp.Table))
+            table_aliases = {
+                (table.alias_or_name or table.name).lower(): table.name.lower()
+                for table in tables if table.name
+            }
+            if not table_aliases:
+                table_aliases = global_aliases
+            only_table = (
+                next(iter(set(table_aliases.values())))
+                if len(set(table_aliases.values())) == 1 else global_only_table
+            )
+            sources = []
+            for column in expression.find_all(exp.Column):
+                table = table_aliases.get(str(column.table).lower(), str(column.table).lower())
+                if not table:
+                    table = only_table
+                if table and column.name:
+                    sources.append(f"{table}.{column.name.lower()}")
+            if alias:
+                mapping[alias] = list(dict.fromkeys(sources))
+        return mapping
+    except Exception:
+        return {}
 
 
 def _structured_table_result(raw: str, sample_limit: int = MAX_RESULT_SAMPLE_ROWS) -> dict:
@@ -803,7 +936,8 @@ def prepare_schema_context(
     tool_context: ToolContext,
 ) -> str:
     """Rank tables/columns and find joins in one preprocessing call."""
-    tool_context.state["task_question"] = question
+    # A repeated call can contain an internal retrieval request, not the task.
+    tool_context.state.setdefault("task_question", question)
     table_result = json.loads(rank_relevant_tables(
         question, candidate_table_count, tool_context,
     ))
@@ -928,15 +1062,46 @@ def inspect_database(sql: str, tool_context: ToolContext) -> str:
     raw = execute_sql(sql, tool_context)
     result = _structured_table_result(raw, sample_limit=50)
     result.setdefault("success", "error" not in result)
+    values_by_column = {
+        column: list(dict.fromkeys(
+            atom for row in result.get("sample_rows", []) or []
+            for atom in _atomic_inspection_values(row.get(column))
+        ))
+        for column in result.get("columns", [])
+    }
+    if values_by_column:
+        result["values_by_column"] = values_by_column
     if len(result.get("columns", [])) == 1:
         column = result["columns"][0]
-        result["values"] = [row[column] for row in result.get("sample_rows", [])]
+        result["values"] = values_by_column.get(column, [])
         result.pop("sample_rows", None)
     result["selection_rule"] = "exact_match_only_no_inferred_synonyms"
-    inspected_columns = sorted(set(re.findall(
-        r"\b([A-Za-z_]\w*\.[A-Za-z_]\w*)\b", sql.lower()
-    )))
+    alias_sources = _inspection_alias_sources(sql)
+    inspected_columns = list(dict.fromkeys(
+        source for sources in alias_sources.values() for source in sources
+    )) or _inspection_column_keys(sql)
     result["inspected_columns"] = inspected_columns
+    evidence = dict(tool_context.state.get("database_inspections", {}))
+    for output_column, sources in alias_sources.items():
+        current_values = values_by_column.get(output_column, [])
+        for source in sources:
+            evidence[source] = list(dict.fromkeys(
+                list(evidence.get(source, [])) + current_values
+            ))
+    if not alias_sources:
+        current_values = [value for values in values_by_column.values() for value in values]
+        for column in inspected_columns:
+            evidence[column] = list(dict.fromkeys(
+                list(evidence.get(column, [])) + current_values
+            ))
+    tool_context.state["database_inspections"] = evidence
+    required_population = _required_population_from_inspection(
+        tool_context.state.get("task_question", ""), evidence,
+    )
+    tool_context.state["required_population"] = required_population
+    if required_population:
+        result["required_population"] = required_population
+    result["evidence_columns"] = sorted(evidence)
     tool_context.state["last_database_inspection"] = {**result, "sql": sql}
     return json.dumps(result, separators=(",", ":"))
 
@@ -1430,6 +1595,13 @@ def _semantic_plan_contract(
         str(item.get("predicate", item.get("expression", "")))
         for item in (plan.get("population_constraints") or []) if isinstance(item, dict)
     ]
+    required_population = tool_context.state.get("required_population", [])
+    population_text = " ".join(populations).lower()
+    required_population_covered = all(
+        str(item.get("column", "")).lower() in population_text
+        and str(item.get("value", "")).lower() in population_text
+        for item in required_population
+    )
     joins = [
         f"{item.get('left', '')}={item.get('right', '')}"
         for item in (plan.get("joins") or []) if isinstance(item, dict)
@@ -1459,8 +1631,10 @@ def _semantic_plan_contract(
     )
     ordering_requested = bool(re.search(r"\b(sort|order|highest|lowest|ascending|descending)\b", question, re.I))
     checks = {
-        "population_grounded": all(populations) and categorical_grounded
-        if plan.get("population_constraints") else True,
+        "population_grounded": (
+            (all(populations) and categorical_grounded)
+            if plan.get("population_constraints") else not required_population
+        ) and required_population_covered,
         "outputs_defined": bool(outputs) if category == "Query" else bool(plan.get("target_objects")),
         "kb_dependencies_complete": selected_kb.issubset(used_kb),
         "join_path_grounded": all(
@@ -1580,6 +1754,17 @@ def validate_query_plan(tool_context: ToolContext) -> str:
 
     category = candidate["category"]
     plan = candidate["plan"]
+    question = str(tool_context.state.get("task_question", ""))
+    explicit_percentage = bool(re.search(r"\b(percent|percentage)\b", question, re.I))
+    for output in plan.get("output_columns", []) or []:
+        if not isinstance(output, dict):
+            continue
+        output_text = f"{output.get('name', '')} {output.get('expression', '')}"
+        if re.search(r"percent(?:ile)?[_\s-]*rank|percent_rank", output_text, re.I):
+            expected_scale = "0_to_100" if explicit_percentage else "0_to_1"
+            if output.get("scale") != expected_scale:
+                output["scale"] = expected_scale
+                warnings.append(f"Percentile rank scale normalized to {expected_scale}")
     selected_tables = {str(table).lower() for table in context.get("selected_tables", [])}
     selected_columns = {
         f"{str(item.get('table', '')).lower()}.{str(item.get('column', '')).lower()}"
@@ -1652,9 +1837,14 @@ def validate_query_plan(tool_context: ToolContext) -> str:
         literals = re.findall(r"'([^']+)'", predicate)
         if literals:
             inspection = tool_context.state.get("last_database_inspection", {})
-            observed_values = {
-                str(value).lower() for value in inspection.get("values", [])
-            }
+            cumulative = tool_context.state.get("database_inspections", {})
+            relevant_evidence = [
+                value for ref in refs for value in cumulative.get(ref, [])
+            ]
+            if not relevant_evidence:
+                relevant_evidence = [value for values in cumulative.values() for value in values]
+            observed_values = {str(value).lower() for value in relevant_evidence}
+            observed_values.update(str(value).lower() for value in inspection.get("values", []))
             for row in inspection.get("sample_rows", []) or []:
                 observed_values.update(str(value).lower() for value in row.values())
             if constraint.get("value_verified") is not True:
@@ -1667,13 +1857,13 @@ def validate_query_plan(tool_context: ToolContext) -> str:
                     f"Categorical values were not observed by inspect_database: {unobserved}"
                 )
             phrase_tokens = {
-                token[:-1] if token.endswith("s") else token
+                _singular_token(token)
                 for token in re.findall(r"[a-z0-9]+", str(constraint.get("phrase", "")).lower())
             }
             directly_named = {
                 value for value in observed_values
                 if any(
-                    (token[:-1] if token.endswith("s") else token) in phrase_tokens
+                    _singular_token(token) in phrase_tokens
                     for token in re.findall(r"[a-z0-9]+", value)
                 )
             }
@@ -1687,6 +1877,20 @@ def validate_query_plan(tool_context: ToolContext) -> str:
                     "Categorical values are broader than the request's exact wording: "
                     f"{unsupported}; add equivalence_reason only when the request or KB equates them"
                 )
+
+    population_text = " ".join(
+        str(item.get("predicate", item.get("expression", ""))).lower()
+        for item in (plan.get("population_constraints", []) or [])
+        if isinstance(item, dict)
+    )
+    for requirement in tool_context.state.get("required_population", []):
+        column = str(requirement.get("column", "")).lower()
+        value = str(requirement.get("value", "")).lower()
+        if column not in population_text or value not in population_text:
+            errors.append(
+                "Request-named inspected value is missing from population_constraints: "
+                f"{column} = {requirement.get('value')!r}"
+            )
 
     for output in plan.get("output_columns", []) or []:
         if not isinstance(output, dict) or not output.get("filter"):
@@ -2016,14 +2220,36 @@ def validate_sql_to_plan(
                     f"Include the planned target object {target}.",
                 )
 
+        calculation_expressions = {
+            str(item.get("name", "")).lower(): str(item.get("expression", "")).lower()
+            for item in (plan.get("calculations") or []) if isinstance(item, dict)
+            and item.get("name") and item.get("expression")
+        }
+
+        def expand_calculations(expression: str, seen: Optional[set[str]] = None) -> str:
+            expanded = str(expression).lower()
+            visited = set(seen or set())
+            for name, definition in calculation_expressions.items():
+                if name in visited or not re.search(rf"\b{re.escape(name)}\b", expanded):
+                    continue
+                replacement = expand_calculations(definition, visited | {name})
+                expanded = re.sub(rf"\b{re.escape(name)}\b", f"({replacement})", expanded)
+            return expanded
+
+        ignored_expression_tokens = {
+            "select", "where", "and", "or", "as", "null", "true", "false",
+            "numeric", "decimal", "double", "precision", "round", "cast", "case",
+            "when", "then", "else", "end", "sqrt", "log", "abs", "power",
+        } | planned_tables
+
         for field in ("calculations", "conditions", "output_columns"):
             for item in plan.get(field, []) or []:
                 if not isinstance(item, dict) or item.get("knowledge_id") is None:
                     continue
-                expression = str(item.get("expression", ""))
-                required = set(re.findall(r"\b[a-zA-Z_][\w]*\b|\b\d+(?:\.\d+)?\b", expression.lower()))
-                required -= {"select", "where", "and", "or", "as", "null"}
-                required -= planned_tables
+                expression = expand_calculations(str(item.get("expression", "")))
+                required = set(re.findall(
+                    r"\b[a-zA-Z_][\w]*\b|\b\d+(?:\.\d+)?\b", expression
+                )) - ignored_expression_tokens
                 missing = sorted(token for token in required if token not in sql_lower)
                 if missing:
                     add_diagnosis(
@@ -2055,28 +2281,31 @@ def validate_sql_to_plan(
             where.sql(dialect="postgres").lower()
             for tree in trees for where in tree.find_all(exp.Where)
         )
-        calculation_expressions = {
-            str(item.get("name", "")).lower(): str(item.get("expression", "")).lower()
-            for item in (plan.get("calculations") or []) if isinstance(item, dict)
-            and item.get("name") and item.get("expression")
-        }
         for constraint in population_constraints:
             if not isinstance(constraint, dict):
                 continue
             predicate = str(constraint.get("predicate", constraint.get("expression", ""))).lower()
-            expanded_predicate = predicate
-            for name, expression in calculation_expressions.items():
-                expanded_predicate = re.sub(
-                    rf"\b{re.escape(name)}\b", f"({expression})", expanded_predicate,
+            expanded_predicate = expand_calculations(predicate)
+
+            def missing_where_tokens(expression: str) -> list[str]:
+                required = set(re.findall(
+                    r"\b[a-zA-Z_]\w*\b|'[^']*'|\b\d+(?:\.\d+)?\b", expression
+                )) - ignored_expression_tokens - {"not", "is"}
+                return sorted(token for token in required if token.strip("'") not in where_sql)
+
+            missing = missing_where_tokens(predicate)
+            if missing:
+                missing = missing_where_tokens(expanded_predicate)
+            if missing:
+                threshold_tokens = re.findall(
+                    r"(?:>=|<=|<>|!=|=|>|<)\s*(-?\d+(?:\.\d+)?)", predicate
                 )
-            required = set(re.findall(
-                r"\b[a-zA-Z_]\w*\b|'[^']*'|\b\d+(?:\.\d+)?\b", expanded_predicate
-            ))
-            required -= planned_tables | {
-                "and", "or", "not", "is", "null", "true", "false", "numeric",
-                "decimal", "double", "precision", "round", "cast",
-            }
-            missing = sorted(token for token in required if token.strip("'") not in where_sql)
+                alias_in_where = any(
+                    re.search(rf"\b{re.escape(name)}\b", where_sql)
+                    for name in calculation_expressions
+                )
+                if alias_in_where and all(token in where_sql for token in threshold_tokens):
+                    missing = []
             if missing:
                 add_diagnosis(
                     "population_constraint_missing",

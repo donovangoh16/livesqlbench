@@ -11,6 +11,7 @@ from system_agent.tools import (
     generate_query_plan,
     inspect_database,
     prepare_knowledge_context,
+    prepare_schema_context,
     validate_query_plan,
     validate_sql_to_plan,
 )
@@ -162,6 +163,24 @@ class QueryPlanToolTests(unittest.TestCase):
         self.assertFalse(result["semantic_contract"]["checks"]["ordering_covered"])
         self.assertEqual(result["semantic_contract"]["next"], "regenerate_plan")
 
+    @patch("system_agent.tools.rank_relevant_columns")
+    @patch("system_agent.tools.get_selected_schema")
+    @patch("system_agent.tools.rank_relevant_tables")
+    def test_repeated_schema_preparation_preserves_original_question(
+        self, tables, schema, columns,
+    ):
+        state = valid_state()
+        state["task_question"] = "Show vendors ordered by score descending."
+        context = SimpleNamespace(state=state)
+        tables.return_value = json.dumps({"ranked_tables": []})
+        schema.return_value = json.dumps({"tables": []})
+        columns.return_value = json.dumps({"ranked_columns": []})
+        prepare_schema_context("Find dependency columns", 3, 5, context)
+        self.assertEqual(
+            context.state["task_question"],
+            "Show vendors ordered by score descending.",
+        )
+
     def test_generation_strategy_covers_all_category_difficulty_pairs(self):
         expected = {
             ("Query", "easy"): "single_select",
@@ -181,6 +200,34 @@ class QueryPlanToolTests(unittest.TestCase):
         result = json.loads(inspect_database("SELECT DISTINCT devscope", context))
         self.assertEqual(result["values"], ["Controller", "Gamepad"])
         self.assertEqual(result["selection_rule"], "exact_match_only_no_inferred_synonyms")
+
+    @patch("system_agent.tools.execute_sql")
+    def test_inspection_evidence_accumulates_and_handles_mice(self, execute):
+        execute.side_effect = [
+            "kind\n----\nKeyboard\nMouse",
+            "name\n----\nRetail\nOnline",
+        ]
+        state = valid_state()
+        state["preprocessing_context"]["selected_columns"].append(
+            {"table": "vendors", "column": "kind"}
+        )
+        context = SimpleNamespace(state=state)
+        inspect_database("SELECT DISTINCT v.kind FROM vendors v", context)
+        inspect_database("SELECT DISTINCT m.name FROM markets m", context)
+        self.assertEqual(context.state["database_inspections"]["vendors.kind"], [
+            "Keyboard", "Mouse",
+        ])
+        result = json.loads(generate_and_validate_query_plan("Query", {
+            "operation": "SELECT", "result_grain": "one row per vendor",
+            "source_tables": ["vendors"], "joins": [],
+            "output_columns": ["vendors.vendregistry"],
+            "population_constraints": [{
+                "phrase": "keyboards and mice",
+                "predicate": "vendors.kind IN ('Keyboard', 'Mouse')",
+                "value_verified": True,
+            }],
+        }, context))
+        self.assertTrue(result["valid"])
 
     @patch("system_agent.tools.execute_sql")
     def test_execution_returns_compact_structured_summary(self, execute):
@@ -332,6 +379,52 @@ class QueryPlanToolTests(unittest.TestCase):
         self.assertTrue(context.state["sql_generation_completed"])
         self.assertIn("draft_sql", context.state)
 
+    @patch("system_agent.tools.execute_sql")
+    def test_aggregate_inspection_flattens_values_and_maps_source(self, execute):
+        execute.return_value = (
+            "devscope_values | mechanical_columns\n"
+            "------------------------------------\n"
+            "['Controller', 'Keyboard', 'Mouse'] | ['ergorate', 'palmangle', 'wristflag']"
+        )
+        context = SimpleNamespace(state={"task_question": "Show gaming controllers"})
+        sql = (
+            "SELECT "
+            "(SELECT array_agg(DISTINCT devscope::text) FROM testsessions) AS devscope_values, "
+            "(SELECT array_agg(DISTINCT column_name) FROM information_schema.columns "
+            "WHERE table_name='mechanical') AS mechanical_columns"
+        )
+        result = json.loads(inspect_database(sql, context))
+        self.assertEqual(result["values_by_column"]["devscope_values"], [
+            "Controller", "Keyboard", "Mouse",
+        ])
+        self.assertEqual(context.state["database_inspections"]["testsessions.devscope"], [
+            "Controller", "Keyboard", "Mouse",
+        ])
+        self.assertEqual(result["required_population"], [{
+            "phrase": "Controller", "column": "testsessions.devscope",
+            "value": "Controller", "value_verified": True,
+        }])
+
+    def test_request_named_inspected_value_is_required_in_plan(self):
+        state = valid_state()
+        state["task_question"] = "Show active vendors"
+        state["preprocessing_context"]["selected_columns"].append(
+            {"table": "vendors", "column": "status"}
+        )
+        state["required_population"] = [{
+            "phrase": "Active", "column": "vendors.status",
+            "value": "Active", "value_verified": True,
+        }]
+        context = SimpleNamespace(state=state)
+        result = json.loads(generate_and_validate_query_plan("Query", {
+            "operation": "SELECT", "result_grain": "one row per vendor",
+            "source_tables": ["vendors"], "joins": [],
+            "output_columns": ["vendors.vendregistry"],
+            "population_constraints": [],
+        }, context))
+        self.assertFalse(result["valid"])
+        self.assertTrue(any("vendors.status" in error for error in result["errors"]))
+
     def test_sql_rejects_extra_exposed_outputs(self):
         context = SimpleNamespace(state=valid_state())
         result = json.loads(generate_and_validate_query_plan("Query", {
@@ -344,6 +437,51 @@ class QueryPlanToolTests(unittest.TestCase):
             "SELECT vendregistry, mktref FROM vendors", 1, context,
         ))
         self.assertTrue(any(d["code"] == "OUTPUT_COUNT_MISMATCH" for d in checked["diagnoses"]))
+
+    def test_percentile_rank_defaults_to_zero_to_one_scale(self):
+        state = valid_state()
+        state["task_question"] = "Show the percentile ranking within each market."
+        context = SimpleNamespace(state=state)
+        result = json.loads(generate_and_validate_query_plan("Query", {
+            "operation": "SELECT", "result_grain": "one row per vendor",
+            "source_tables": ["vendors"], "joins": [],
+            "output_columns": [{
+                "name": "percentile_rank",
+                "expression": "PERCENT_RANK() OVER (ORDER BY vendors.vendregistry)",
+                "scale": "0_to_100",
+            }],
+        }, context))
+        self.assertTrue(result["valid"])
+        self.assertEqual(
+            context.state["query_plan"]["plan"]["output_columns"][0]["scale"], "0_to_1",
+        )
+        checked = json.loads(validate_sql_to_plan(
+            "SELECT PERCENT_RANK() OVER (ORDER BY vendregistry) * 100 FROM vendors",
+            1, context,
+        ))
+        self.assertTrue(any(d["code"] == "OUTPUT_SCALE_MISMATCH" for d in checked["diagnoses"]))
+
+    def test_population_validator_accepts_calculated_alias_in_where(self):
+        context = SimpleNamespace(state=valid_state())
+        result = json.loads(generate_and_validate_query_plan("Query", {
+            "operation": "SELECT", "result_grain": "one row per vendor",
+            "source_tables": ["vendors"], "joins": [],
+            "output_columns": [{"name": "par", "expression": "par"}],
+            "calculations": [{
+                "name": "par", "expression": "vendors.vendregistry * 2.0",
+            }],
+            "population_constraints": [{
+                "phrase": "PAR exceeding 8.5",
+                "predicate": "vendors.vendregistry * 2.0 > 8.5",
+            }],
+            "requires_cte": True,
+        }, context))
+        self.assertTrue(result["valid"])
+        checked = json.loads(validate_sql_to_plan(
+            "WITH calc AS (SELECT vendregistry * 2.0 AS par FROM vendors) "
+            "SELECT par FROM calc WHERE par > 8.5", 1, context,
+        ))
+        self.assertTrue(checked["valid"], checked.get("diagnoses"))
 
     def test_transitive_kb_dependencies_count_as_used(self):
         state = valid_state()
