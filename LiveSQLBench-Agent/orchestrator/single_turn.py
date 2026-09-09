@@ -46,6 +46,7 @@ async def init_agent_session(task_id: str, task_data: dict, variant: VariantConf
         "task_id": task_id,
         "db_name": task_data["selected_database"],
         "user_query": task_data["query"],
+        "task_category": task_data.get("category"),
         "steps_remaining": MAX_STEPS,
         "max_steps": MAX_STEPS,
         "total_reward": 0.0,

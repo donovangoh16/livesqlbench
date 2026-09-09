@@ -41,7 +41,18 @@ async def run_parallel_evaluation(
         "tasks_observed": 0,
         "calls_observed": 0,
         "duplicate_calls_detected": 0,
+        "duplicate_calls_blocked": 0,
         "no_progress_events_detected": 0,
+        "no_progress_calls_blocked": 0,
+        "execution_diagnoses_required": 0,
+        "execution_diagnoses_completed": 0,
+        "semantic_reviews_required": 0,
+        "semantic_reviews_completed": 0,
+        "empty_result_advisories": 0,
+        "management_no_progress_advisories": 0,
+        "budget_warnings": 0,
+        "budget_blocks": 0,
+        "budget_warning_events": {},
         "blocked_calls": 0,
         "block_reasons": {},
         "max_no_progress_streak": 0,
@@ -105,7 +116,13 @@ async def run_parallel_evaluation(
                 harness_totals["tasks_observed"] += 1
                 for key in (
                     "calls_observed", "duplicate_calls_detected",
-                    "no_progress_events_detected", "blocked_calls",
+                    "duplicate_calls_blocked", "no_progress_events_detected",
+                    "no_progress_calls_blocked", "execution_diagnoses_required",
+                    "execution_diagnoses_completed", "semantic_reviews_required",
+                    "semantic_reviews_completed", "empty_result_advisories",
+                    "management_no_progress_advisories",
+                    "budget_warnings", "budget_blocks",
+                    "blocked_calls",
                 ):
                     harness_totals[key] += int(harness.get(key, 0) or 0)
                 harness_totals["max_no_progress_streak"] = max(
@@ -119,6 +136,11 @@ async def run_parallel_evaluation(
                 for reason, count in harness.get("block_reasons", {}).items():
                     harness_totals["block_reasons"][reason] = (
                         harness_totals["block_reasons"].get(reason, 0) + int(count or 0)
+                    )
+                for event, count in harness.get("budget_warning_events", {}).items():
+                    harness_totals["budget_warning_events"][event] = (
+                        harness_totals["budget_warning_events"].get(event, 0)
+                        + int(count or 0)
                     )
             completed += 1
             if completed % 5 == 0 or completed == len(tasks):

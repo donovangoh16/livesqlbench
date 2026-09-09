@@ -102,7 +102,12 @@ async def after_tool_callback(
     from system_agent.harness import observe_tool_call
     observe_tool_call(tool_context.state, tool_name, args, tool_response)
 
+    from system_agent.harness import take_budget_warning
+    budget_warning = take_budget_warning(tool_context.state)
+
     if steps_after > 0:
         note = f"\n\n[SYSTEM NOTE: Steps remaining: {steps_after}/{max_steps}]"
+        if budget_warning:
+            note += f"\n[HARNESS BUDGET: {budget_warning}]"
         return str(tool_response) + note
     return None
