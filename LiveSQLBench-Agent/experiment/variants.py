@@ -1,7 +1,7 @@
 """Single source of truth for the four SQL-agent experiment variants.
 
-Agent prompt improvements are active for variants 1 and 3. Harness behavior
-remains baseline until its intervention is implemented.
+Agent prompt improvements are active for variants 1 and 3. Observation-only
+harness instrumentation is active for variants 2 and 3.
 """
 
 from dataclasses import asdict, dataclass
@@ -28,8 +28,11 @@ class VariantConfig:
 VARIANTS = {
     0: VariantConfig(0, "baseline", "baseline"),
     1: VariantConfig(1, "improved", "baseline", active_agent_profile="improved"),
-    2: VariantConfig(2, "baseline", "improved"),
-    3: VariantConfig(3, "improved", "improved", active_agent_profile="improved"),
+    2: VariantConfig(2, "baseline", "improved", active_harness_profile="improved"),
+    3: VariantConfig(
+        3, "improved", "improved",
+        active_agent_profile="improved", active_harness_profile="improved",
+    ),
 }
 
 

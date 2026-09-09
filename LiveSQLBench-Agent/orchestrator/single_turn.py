@@ -107,6 +107,8 @@ async def run_single_task(
 
         run_result = await run_agent_session(instance_id, initial_message)
         state = run_result.get("state", {})
+        from system_agent.harness import finalize_harness_metrics
+        finalize_harness_metrics(state)
         elapsed = time.time() - start_time
 
         steps_used = MAX_STEPS - max(0, state.get("steps_remaining", MAX_STEPS))
@@ -130,6 +132,8 @@ async def run_single_task(
             "final_response": run_result.get("response", ""),
             "experiment": variant.as_dict(),
         }
+        if isinstance(state.get("harness_metrics"), dict):
+            result["harness_metrics"] = state["harness_metrics"]
         logger.info(
             "Task %s done. Reward: %.2f, Steps used: %d, Time: %.1fs",
             instance_id,

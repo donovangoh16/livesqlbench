@@ -67,6 +67,11 @@ async def before_tool_callback(
     steps = tool_context.state.get("steps_remaining", 0)
     tool_context.state["_steps_before"] = steps
 
+    from system_agent.harness import authorize_tool_call
+    blocked = authorize_tool_call(tool_context.state, tool.name, args)
+    if blocked is not None:
+        return blocked
+
     if steps <= 0:
         return {"error": "No steps remaining. You must stop."}
 
@@ -93,6 +98,9 @@ async def after_tool_callback(
         "steps_after": steps_after,
     })
     tool_context.state["tool_trajectory"] = trajectory
+
+    from system_agent.harness import observe_tool_call
+    observe_tool_call(tool_context.state, tool_name, args, tool_response)
 
     if steps_after > 0:
         note = f"\n\n[SYSTEM NOTE: Steps remaining: {steps_after}/{max_steps}]"

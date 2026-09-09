@@ -283,6 +283,31 @@ class QueryPlanToolTests(unittest.TestCase):
         ])
         self.assertEqual(result["required_schema"]["deviceidentity"], ["wlrangem"])
 
+    @patch("system_agent.tools._column_metadata", return_value={})
+    @patch("system_agent.tools._post_json")
+    @patch("system_agent.tools._knowledge_names")
+    def test_later_kb_lookup_adds_evidence_without_replacing_requirements(
+        self, names, post, _columns,
+    ):
+        names.return_value = ["Primary Score", "Exploratory Score"]
+        definitions = {
+            "Primary Score": {"id": 6, "knowledge": "Primary Score", "definition": "x / 2.0"},
+            "Exploratory Score": {"id": 21, "knowledge": "Exploratory Score", "definition": "y / 3.0"},
+        }
+        post.side_effect = lambda path, payload: {
+            "knowledge": json.dumps(definitions[payload["knowledge_name"]])
+        }
+        context = SimpleNamespace(state={"task_id": "credit_M_4"})
+        first = json.loads(prepare_knowledge_context(
+            "Use Primary Score", ["Primary Score"], [], context,
+        ))
+        second = json.loads(prepare_knowledge_context(
+            "Check Exploratory Score", ["Exploratory Score"], [], context,
+        ))
+        self.assertEqual(first["required_knowledge_ids"], [6])
+        self.assertEqual(second["required_knowledge_ids"], [6])
+        self.assertEqual({item["id"] for item in second["knowledge"]}, {6, 21})
+
     def test_state_backed_execution_requires_validated_sql(self):
         context = SimpleNamespace(state={})
         result = json.loads(execute_validated_sql(context))
@@ -326,6 +351,29 @@ class QueryPlanToolTests(unittest.TestCase):
         self.assertFalse(result["valid"])
         self.assertTrue(any("broader" in error for error in result["errors"]))
 
+    def test_json_path_keys_are_not_treated_as_categorical_values(self):
+        state = valid_state()
+        state["preprocessing_context"]["selected_tables"].append("bank_and_transactions")
+        state["preprocessing_context"]["selected_columns"].append({
+            "table": "bank_and_transactions", "column": "chaninvdatablock",
+        })
+        state["last_database_inspection"] = {"values": ["High", "Yes"]}
+        context = SimpleNamespace(state=state)
+        result = json.loads(generate_and_validate_query_plan("Query", {
+            "operation": "SELECT", "result_grain": "one row per transaction",
+            "source_tables": ["bank_and_transactions"], "joins": [],
+            "output_columns": ["bank_and_transactions.bankexpref"],
+            "population_constraints": [{
+                "phrase": "Digital First Customer",
+                "predicate": (
+                    "bank_and_transactions.chaninvdatablock->>'onlineuse' = 'High' "
+                    "AND bank_and_transactions.chaninvdatablock->>'autopay' = 'Yes'"
+                ),
+                "value_verified": True,
+            }],
+        }, context))
+        self.assertTrue(result["valid"], result.get("errors"))
+
     def test_output_filter_requires_local_sql_filter(self):
         state = valid_state()
         state["preprocessing_context"]["selected_knowledge"] = [{"id": 50, "name": "Eligible"}]
@@ -367,6 +415,323 @@ class QueryPlanToolTests(unittest.TestCase):
         self.assertEqual(second["version"], 2)
         self.assertEqual(len(context.state["query_plan_history"]), 2)
 
+    def test_parameter_only_management_function_needs_no_source_table(self):
+        context = SimpleNamespace(state=valid_state())
+        result = json.loads(generate_and_validate_query_plan("Management", {
+            "operation": "CREATE FUNCTION",
+            "target_objects": [{"type": "function", "name": "calculate_score"}],
+            "parameters": [{"name": "x", "type": "numeric"}],
+            "return_contract": {"type": "numeric"},
+            "language": "sql",
+            "body_requirements": [{"expression": "x * 2.0"}],
+        }, context))
+        self.assertTrue(result["valid"], result.get("errors"))
+        checked = json.loads(validate_sql_to_plan(
+            "CREATE FUNCTION calculate_score(x numeric) RETURNS numeric "
+            "LANGUAGE SQL AS $$ SELECT x * 2.0 $$;", 1, context,
+        ))
+        self.assertTrue(checked["valid"], checked.get("diagnoses"))
+
+    def test_management_target_dictionary_uses_its_name(self):
+        context = SimpleNamespace(state=valid_state())
+        result = json.loads(generate_and_validate_query_plan("Management", {
+            "operation": "ALTER TABLE",
+            "target_objects": [{"type": "table", "name": "vendors"}],
+            "schema_changes": [{
+                "action": "ADD COLUMN", "name": "active", "type": "boolean",
+            }],
+        }, context))
+        self.assertTrue(result["valid"], result.get("errors"))
+        checked = json.loads(validate_sql_to_plan(
+            "ALTER TABLE vendors ADD COLUMN active boolean;", 1, context,
+        ))
+        self.assertTrue(checked["valid"], checked.get("diagnoses"))
+
+    def test_management_scalar_condition_is_normalized(self):
+        context = SimpleNamespace(state=valid_state())
+        result = json.loads(generate_and_validate_query_plan("Management", {
+            "operation": "DELETE",
+            "target_objects": ["vendors"],
+            "affected_row_conditions": "vendors.vendregistry > 10",
+        }, context))
+        self.assertTrue(result["valid"], result.get("errors"))
+        condition = context.state["query_plan"]["plan"]["affected_row_conditions"][0]
+        self.assertEqual(condition["expression"], "vendors.vendregistry > 10")
+
+    def test_management_condition_separates_phrase_from_sql_expression(self):
+        context = SimpleNamespace(state=valid_state())
+        result = json.loads(generate_and_validate_query_plan("Management", {
+            "operation": "DELETE", "target_objects": ["vendors"],
+            "affected_row_conditions": (
+                "Delete vendors meeting the policy: vendors.vendregistry > 10 AND vendors.mktref > 0"
+            ),
+        }, context))
+        self.assertTrue(result["valid"], result.get("errors"))
+        condition = context.state["query_plan"]["plan"]["affected_row_conditions"][0]
+        self.assertEqual(condition["phrase"], "Delete vendors meeting the policy")
+        self.assertEqual(
+            condition["expression"],
+            "vendors.vendregistry > 10 AND vendors.mktref > 0",
+        )
+
+    def test_management_sql_template_statement_is_semantically_normalized(self):
+        context = SimpleNamespace(state=valid_state())
+        result = json.loads(generate_and_validate_query_plan("Management", {
+            "operation": "CREATE FUNCTION",
+            "target_objects": [{"type": "function", "name": "calculate_score"}],
+            "body_requirements": [{"expression": "x * 2.0"}],
+            "required_statements": [
+                "CREATE OR REPLACE FUNCTION calculate_score(...) RETURNS numeric LANGUAGE SQL AS $$ ... $$;"
+            ],
+        }, context))
+        self.assertTrue(result["valid"], result.get("errors"))
+        statement = context.state["query_plan"]["plan"]["required_statements"][0]
+        self.assertEqual(statement["operation"], "CREATE_FUNCTION")
+        self.assertEqual(statement["target"], "calculate_score")
+        checked = json.loads(validate_sql_to_plan(
+            "CREATE FUNCTION calculate_score(x numeric) RETURNS numeric "
+            "LANGUAGE SQL AS $$ SELECT x * 2.0 $$;", 1, context,
+        ))
+        self.assertTrue(checked["valid"], checked.get("diagnoses"))
+
+    def test_management_statement_alias_fields_are_normalized(self):
+        context = SimpleNamespace(state=valid_state())
+        result = json.loads(generate_and_validate_query_plan("Management", {
+            "operation": "CREATE INDEX",
+            "target_objects": [{"type": "index", "name": "idx_vendor_market"}],
+            "required_statements": [{
+                "statement_type": "CREATE_INDEX",
+                "object_name": "idx_vendor_market",
+            }],
+        }, context))
+        self.assertTrue(result["valid"], result.get("errors"))
+        statement = context.state["query_plan"]["plan"]["required_statements"][0]
+        self.assertEqual(statement["operation"], "CREATE_INDEX")
+        self.assertEqual(statement["target"], "idx_vendor_market")
+
+    def test_management_sql_kind_and_compound_operations_are_normalized(self):
+        context = SimpleNamespace(state=valid_state())
+        result = json.loads(generate_and_validate_query_plan("Management", {
+            "operation": "ALTER TABLE",
+            "target_objects": [{"type": "table", "name": "vendors"}],
+            "schema_changes": [{"action": "ADD COLUMN", "name": "active", "type": "boolean"}],
+            "affected_row_conditions": "all rows in vendors",
+            "required_statements": [
+                {"statement_type": "alter_table_add_column", "target": "vendors"},
+                {"sql_kind": "UPDATE_BACKFILL", "target": "vendors"},
+            ],
+        }, context))
+        self.assertTrue(result["valid"], result.get("errors"))
+        plan = context.state["query_plan"]["plan"]
+        self.assertEqual(plan["affected_row_conditions"], [])
+        self.assertEqual(
+            [item["operation"] for item in plan["required_statements"]],
+            ["ALTER_TABLE", "UPDATE"],
+        )
+
+    def test_nested_details_sql_identifies_do_block(self):
+        context = SimpleNamespace(state=valid_state())
+        result = json.loads(generate_and_validate_query_plan("Management", {
+            "operation": "ALTER TABLE",
+            "target_objects": [{"type": "table", "name": "vendors"}],
+            "schema_changes": [{"action": "ADD COLUMN", "name": "active", "type": "boolean"}],
+            "required_statements": [{
+                "statement_type": "sql", "target": "vendors",
+                "details": {"sql": "DO $$ BEGIN UPDATE vendors SET active = true; END $$;"},
+            }],
+        }, context))
+        self.assertTrue(result["valid"], result.get("errors"))
+        statement = context.state["query_plan"]["plan"]["required_statements"][0]
+        self.assertEqual(statement["operation"], "DO_BLOCK")
+
+    def test_arbitrary_nested_sql_intent_is_detected(self):
+        context = SimpleNamespace(state=valid_state())
+        result = json.loads(generate_and_validate_query_plan("Management", {
+            "operation": "ALTER TABLE",
+            "target_objects": [{"type": "table", "name": "vendors"}],
+            "schema_changes": [{"action": "ADD COLUMN", "name": "active", "type": "boolean"}],
+            "required_statements": [{
+                "metadata": {"sql_intent": "ALTER TABLE vendors ADD COLUMN active boolean"},
+            }],
+        }, context))
+        self.assertTrue(result["valid"], result.get("errors"))
+        statement = context.state["query_plan"]["plan"]["required_statements"][0]
+        self.assertEqual(statement["operation"], "ALTER_TABLE")
+        self.assertEqual(statement["target"], "vendors")
+
+    def test_statement_template_beats_longer_sql_like_prose(self):
+        context = SimpleNamespace(state=valid_state())
+        result = json.loads(generate_and_validate_query_plan("Management", {
+            "operation": "CREATE_INDEX",
+            "target_objects": [{"type": "index", "name": "idx_vendor_market"}],
+            "required_statements": [{
+                "statement_purpose": (
+                    "Create a highly optimized index for repeated filtering and reporting"
+                ),
+                "statement_template": "CREATE INDEX idx_vendor_market ON vendors (mktref)",
+            }],
+        }, context))
+        self.assertTrue(result["valid"], result.get("errors"))
+        statement = context.state["query_plan"]["plan"]["required_statements"][0]
+        self.assertEqual(statement["operation"], "CREATE_INDEX")
+        self.assertEqual(statement["target"], "idx_vendor_market")
+
+    def test_plan_rejects_clamping_not_present_in_kb_definition(self):
+        state = valid_state()
+        state["preprocessing_context"]["selected_knowledge"] = [{"id": 6}]
+        state["prepared_knowledge_context"] = {
+            "required_knowledge_ids": [6],
+            "knowledge": [{
+                "id": 6, "name": "FSI",
+                "definition": "FSI = 0.3 * (1 - debt_ratio) + 0.7 * liquid_ratio",
+                "depends_on": [],
+            }],
+        }
+        context = SimpleNamespace(state=state)
+        result = json.loads(generate_and_validate_query_plan("Management", {
+            "operation": "UPDATE",
+            "target_objects": [{"type": "table", "name": "vendors"}],
+            "mutations": [{
+                "target": "score",
+                "expression": "LEAST(GREATEST(0.3 * (1 - debt_ratio), 0), 1)",
+                "knowledge_id": 6,
+            }],
+        }, context))
+        self.assertFalse(result["valid"])
+        self.assertTrue(any("unrequested clamping" in error for error in result["errors"]))
+
+    def test_calculated_column_plan_requires_update_backfill(self):
+        state = valid_state()
+        state["preprocessing_context"]["selected_knowledge"] = [{"id": 10}]
+        state["prepared_knowledge_context"] = {
+            "required_knowledge_ids": [10],
+            "knowledge": [{"id": 10, "name": "Prime", "definition": "prime = score > 720"}],
+        }
+        context = SimpleNamespace(state=state)
+        result = json.loads(generate_and_validate_query_plan("Management", {
+            "operation": "ALTER_TABLE_ADD_COLUMN",
+            "target_objects": [{"type": "column", "name": "vendors.prime"}],
+            "calculations": [{"name": "prime", "expression": "score > 720", "knowledge_id": 10}],
+            "required_statements": [{"statement": "ALTER TABLE vendors ADD COLUMN prime boolean"}],
+        }, context))
+        self.assertFalse(result["valid"])
+        self.assertTrue(any("UPDATE backfill" in error for error in result["errors"]))
+
+    def test_sql_comments_cannot_satisfy_kb_expression(self):
+        state = valid_state()
+        state["preprocessing_context"]["selected_knowledge"] = [{"id": 5}]
+        state["prepared_knowledge_context"] = {
+            "required_knowledge_ids": [5],
+            "knowledge": [{"id": 5, "name": "score", "definition": "score = x * 2.0"}],
+        }
+        context = SimpleNamespace(state=state)
+        planned = json.loads(generate_and_validate_query_plan("Management", {
+            "operation": "CREATE_FUNCTION",
+            "target_objects": [{"type": "function", "name": "calculate_score"}],
+            "body_requirements": [{"expression": "x * 2.0", "knowledge_id": 5}],
+        }, context))
+        self.assertTrue(planned["valid"], planned.get("errors"))
+        checked = json.loads(validate_sql_to_plan(
+            "CREATE FUNCTION calculate_score(x numeric) RETURNS numeric "
+            "LANGUAGE SQL AS $$ SELECT x /* x * 2.0 */ $$;", 1, context,
+        ))
+        self.assertFalse(checked["valid"])
+        self.assertTrue(any(
+            item["type"] == "kb_expression_mismatch" for item in checked["diagnoses"]
+        ))
+
+    def test_not_null_after_add_requires_backfill(self):
+        context = SimpleNamespace(state=valid_state())
+        planned = json.loads(generate_and_validate_query_plan("Management", {
+            "operation": "ALTER_TABLE",
+            "target_objects": [{"type": "table", "name": "vendors"}],
+            "columns": [{"name": "prime", "type": "boolean"}],
+        }, context))
+        self.assertTrue(planned["valid"], planned.get("errors"))
+        checked = json.loads(validate_sql_to_plan(
+            "ALTER TABLE vendors ADD COLUMN prime boolean; "
+            "ALTER TABLE vendors ALTER COLUMN prime SET NOT NULL;", 1, context,
+        ))
+        self.assertFalse(checked["valid"])
+        self.assertTrue(any(
+            item["type"] == "unsafe_not_null_transition" for item in checked["diagnoses"]
+        ))
+
+    def test_repeated_statement_operations_match_sequentially(self):
+        context = SimpleNamespace(state=valid_state())
+        result = json.loads(generate_and_validate_query_plan("Management", {
+            "operation": "ALTER TABLE",
+            "target_objects": [{"type": "table", "name": "vendors"}],
+            "schema_changes": [{"action": "ADD COLUMN", "name": "active", "type": "boolean"}],
+            "required_statements": [
+                {"statement": "ALTER TABLE vendors ADD COLUMN active boolean"},
+                {"sql_kind": "UPDATE_BACKFILL", "target": "vendors"},
+                {"statement": "ALTER TABLE vendors ALTER COLUMN active SET NOT NULL"},
+            ],
+        }, context))
+        self.assertTrue(result["valid"], result.get("errors"))
+        checked = json.loads(validate_sql_to_plan(
+            "ALTER TABLE vendors ADD COLUMN active boolean; "
+            "UPDATE vendors SET active = false; "
+            "ALTER TABLE vendors ALTER COLUMN active SET NOT NULL;",
+            1, context,
+        ))
+        self.assertTrue(checked["valid"], checked.get("diagnoses"))
+
+    def test_symbolic_formula_helper_name_is_not_required_literal_sql(self):
+        state = valid_state()
+        state["preprocessing_context"]["selected_knowledge"] = [{"id": 5}]
+        state["prepared_knowledge_context"] = {
+            "required_knowledge_ids": [5],
+            "knowledge": [{"id": 5, "name": "score", "depends_on": []}],
+        }
+        context = SimpleNamespace(state=state)
+        result = json.loads(generate_and_validate_query_plan("Management", {
+            "operation": "CREATE FUNCTION",
+            "target_objects": [{"type": "function", "name": "calculate_score"}],
+            "body_requirements": [{"expression": "bound_value(x)", "knowledge_id": 5}],
+        }, context))
+        self.assertTrue(result["valid"], result.get("errors"))
+        checked = json.loads(validate_sql_to_plan(
+            "CREATE FUNCTION calculate_score(x numeric) RETURNS numeric "
+            "LANGUAGE SQL AS $$ SELECT LEAST(GREATEST(x, 0), 1) $$;",
+            1, context,
+        ))
+        self.assertTrue(checked["valid"], checked.get("diagnoses"))
+
+    def test_management_statement_sql_field_is_parsed_as_fallback(self):
+        context = SimpleNamespace(state=valid_state())
+        result = json.loads(generate_and_validate_query_plan("Management", {
+            "operation": "ALTER TABLE",
+            "target_objects": [{"type": "table", "name": "vendors"}],
+            "schema_changes": [{"action": "ADD COLUMN", "name": "active", "type": "boolean"}],
+            "required_statements": [{
+                "order": 1,
+                "statement": "ALTER TABLE vendors ADD COLUMN active boolean",
+            }],
+        }, context))
+        self.assertTrue(result["valid"], result.get("errors"))
+        statement = context.state["query_plan"]["plan"]["required_statements"][0]
+        self.assertEqual(statement["operation"], "ALTER_TABLE")
+        self.assertEqual(statement["target"], "vendors")
+
+    def test_only_required_not_all_retrieved_kb_blocks_management_plan(self):
+        state = valid_state()
+        state["preprocessing_context"]["selected_knowledge"] = [
+            {"id": 0}, {"id": 1}, {"id": 5},
+        ]
+        state["prepared_knowledge_context"] = {
+            "required_knowledge_ids": [5],
+            "knowledge": [{"id": 5, "name": "CHS", "depends_on": []}],
+        }
+        context = SimpleNamespace(state=state)
+        result = json.loads(generate_and_validate_query_plan("Management", {
+            "operation": "CREATE FUNCTION",
+            "target_objects": [{"type": "function", "name": "calculate_chs"}],
+            "body_requirements": [{"expression": "x * 2.0", "knowledge_id": 5}],
+        }, context))
+        self.assertTrue(result["valid"], result.get("errors"))
+
     def test_sql_matching_plan_is_recorded_as_draft(self):
         context = self._validated_query_context()
         result = json.loads(validate_sql_to_plan(
@@ -378,6 +743,39 @@ class QueryPlanToolTests(unittest.TestCase):
         self.assertTrue(result["valid"])
         self.assertTrue(context.state["sql_generation_completed"])
         self.assertIn("draft_sql", context.state)
+
+    def test_repeated_sql_diagnosis_becomes_nonretryable(self):
+        context = self._validated_query_context()
+        sql = (
+            "SELECT v.vendregistry FROM vendors v "
+            "JOIN markets m ON v.mktref = m.mktregistry"
+        )
+        first = json.loads(validate_sql_to_plan(sql, 1, context))
+        second = json.loads(validate_sql_to_plan(sql, 1, context))
+        self.assertFalse(first["valid"])
+        self.assertTrue(first["retryable"])
+        self.assertEqual(second["same_diagnosis_count"], 2)
+        self.assertFalse(second["retryable"])
+        history_length = len(context.state["sql_validation_history"])
+        third = json.loads(validate_sql_to_plan(sql, 1, context))
+        self.assertFalse(third["retryable"])
+        self.assertEqual(third["next"], "revise_plan_once_or_stop")
+        self.assertEqual(len(context.state["sql_validation_history"]), history_length)
+
+    def test_validated_sql_can_be_revalidated_after_execution_correction(self):
+        context = self._validated_query_context()
+        first = json.loads(validate_sql_to_plan(
+            "SELECT v.vendregistry FROM vendors v "
+            "LEFT JOIN markets m ON v.mktref = m.mktregistry",
+            1, context,
+        ))
+        self.assertTrue(first["valid"])
+        corrected = json.loads(validate_sql_to_plan(
+            "SELECT v.vendregistry FROM vendors AS v "
+            "LEFT JOIN markets AS m ON v.mktref = m.mktregistry",
+            1, context,
+        ))
+        self.assertTrue(corrected["valid"], corrected.get("diagnoses"))
 
     @patch("system_agent.tools.execute_sql")
     def test_aggregate_inspection_flattens_values_and_maps_source(self, execute):

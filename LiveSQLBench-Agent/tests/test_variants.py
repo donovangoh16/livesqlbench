@@ -29,8 +29,8 @@ class VariantConfigurationTests(unittest.TestCase):
         self.assertEqual(active_profiles, {
             0: ("baseline", "baseline"),
             1: ("improved", "baseline"),
-            2: ("baseline", "baseline"),
-            3: ("improved", "baseline"),
+            2: ("baseline", "improved"),
+            3: ("improved", "improved"),
         })
 
     def test_invalid_variant_is_rejected(self):
@@ -75,6 +75,7 @@ class VariantConfigurationTests(unittest.TestCase):
             "/30.0, never /30",
             "same validation diagnosis more than twice",
             "semantic_contract.summary",
+            "Copy KB formulas literally",
         )
         for marker in markers:
             self.assertIn(marker, IMPROVED_INSTRUCTION)
@@ -84,6 +85,18 @@ class VariantConfigurationTests(unittest.TestCase):
         marker = "Follow generation_strategy"
         self.assertIn(marker, IMPROVED_INSTRUCTION)
         self.assertNotIn(marker, BASELINE_INSTRUCTION)
+
+    def test_management_prompt_uses_operation_specific_contract(self):
+        markers = (
+            "operation-specific contract",
+            "source_tables and joins are required only",
+            "created objects are targets, not ungrounded sources",
+            "Management has structural correction only",
+            "Management submissions must be transaction-compatible",
+        )
+        for marker in markers:
+            self.assertIn(marker, IMPROVED_INSTRUCTION)
+            self.assertNotIn(marker, BASELINE_INSTRUCTION)
 
     def test_improved_tools_are_only_used_by_variants_one_and_three(self):
         baseline_names = tuple(tool.name for tool in get_tools("baseline"))

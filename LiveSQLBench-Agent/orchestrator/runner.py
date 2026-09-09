@@ -37,6 +37,16 @@ async def run_parallel_evaluation(
         "input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
         "cached_input_tokens": 0,
     }
+    harness_totals = {
+        "tasks_observed": 0,
+        "calls_observed": 0,
+        "duplicate_calls_detected": 0,
+        "no_progress_events_detected": 0,
+        "blocked_calls": 0,
+        "block_reasons": {},
+        "max_no_progress_streak": 0,
+        "event_counts": {},
+    }
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
 
     async def _save():
@@ -60,6 +70,10 @@ async def run_parallel_evaluation(
                 "prompt_cache_hit_rate": (
                     token_totals["cached_input_tokens"] / token_totals["input_tokens"]
                     if token_totals["input_tokens"] else 0.0
+                ),
+                **(
+                    {"harness_observation": harness_totals}
+                    if harness_totals["tasks_observed"] else {}
                 ),
             },
             "results": results,
@@ -86,6 +100,26 @@ async def run_parallel_evaluation(
                 p1_count += 1
             for key in token_totals:
                 token_totals[key] += int(r.get(key, 0) or 0)
+            harness = r.get("harness_metrics")
+            if isinstance(harness, dict):
+                harness_totals["tasks_observed"] += 1
+                for key in (
+                    "calls_observed", "duplicate_calls_detected",
+                    "no_progress_events_detected", "blocked_calls",
+                ):
+                    harness_totals[key] += int(harness.get(key, 0) or 0)
+                harness_totals["max_no_progress_streak"] = max(
+                    harness_totals["max_no_progress_streak"],
+                    int(harness.get("max_no_progress_streak", 0) or 0),
+                )
+                for event, count in harness.get("event_counts", {}).items():
+                    harness_totals["event_counts"][event] = (
+                        harness_totals["event_counts"].get(event, 0) + int(count or 0)
+                    )
+                for reason, count in harness.get("block_reasons", {}).items():
+                    harness_totals["block_reasons"][reason] = (
+                        harness_totals["block_reasons"].get(reason, 0) + int(count or 0)
+                    )
             completed += 1
             if completed % 5 == 0 or completed == len(tasks):
                 await _save()
@@ -101,7 +135,12 @@ async def run_parallel_evaluation(
         )
 
 
-def load_tasks(data_path: str, limit: int = None) -> List[dict]:
+def load_tasks(
+    data_path: str,
+    limit: int = None,
+    category: str = None,
+    database: str = None,
+) -> List[dict]:
     tasks = []
     with open(data_path) as f:
         for line in f:
@@ -145,6 +184,16 @@ def load_tasks(data_path: str, limit: int = None) -> List[dict]:
                 "Could not enrich ground-truth records from a base dataset: "
                 + ", ".join(str(value) for value in missing[:10])
             )
+    if category:
+        tasks = [
+            task for task in tasks
+            if str(task.get("category", "")).lower() == category.lower()
+        ]
+    if database:
+        tasks = [
+            task for task in tasks
+            if str(task.get("selected_database", "")).lower() == database.lower()
+        ]
     if limit:
         tasks = tasks[:limit]
     return tasks
@@ -157,6 +206,14 @@ def main():
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--concurrency", type=int, default=5)
     parser.add_argument(
+        "--category", choices=("Query", "Management"), default=None,
+        help="Run only Query or Management tasks; applied before --limit",
+    )
+    parser.add_argument(
+        "--database", default=None,
+        help="Run only tasks from this database; applied before --limit",
+    )
+    parser.add_argument(
         "--variant", type=int, choices=range(4),
         default=settings.experiment_variant,
         help="Experiment variant: 0=baseline, 1=agent, 2=harness, 3=combined",
@@ -166,7 +223,7 @@ def main():
     from orchestrator.single_turn import run_single_task
 
     variant = get_variant(args.variant)
-    tasks = load_tasks(args.data, args.limit)
+    tasks = load_tasks(args.data, args.limit, args.category, args.database)
     logger.info(
         "Single-turn variant %d: requested=(%s, %s), active=(%s, %s)",
         variant.number,

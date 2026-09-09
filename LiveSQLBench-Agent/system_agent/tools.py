@@ -995,6 +995,7 @@ def prepare_knowledge_context(
         if candidates and candidates[0].get("score", 0) >= 0.35:
             selected_names.append(candidates[0]["knowledge_name"])
     selected_names = list(dict.fromkeys(selected_names))[:MAX_RANKED_KNOWLEDGE]
+    primary_names = list(selected_names)
 
     definitions = []
     task_id = _get_task_id(tool_context)
@@ -1023,6 +1024,20 @@ def prepare_knowledge_context(
         definitions.append(item)
         pending.extend(dependency for dependency in dependencies if dependency not in seen)
     selected_names = [item["name"] for item in definitions]
+    task_question = str(tool_context.state.get("task_question", question)).lower()
+    mandatory_names = [
+        name for name in primary_names
+        if any(
+            re.search(rf"\b{re.escape(alias)}\b", task_question)
+            for alias in _knowledge_aliases(name)
+        )
+    ]
+    if not mandatory_names and primary_names:
+        mandatory_names = primary_names[:1]
+    required_knowledge_ids = [
+        item.get("id") for item in definitions
+        if item.get("name") in mandatory_names and item.get("id") is not None
+    ]
     formula_tokens = {
         token.lower() for item in definitions
         for token in re.findall(r"[A-Za-z][A-Za-z0-9_]*", item.get("definition", ""))
@@ -1046,6 +1061,7 @@ def prepare_knowledge_context(
     result = {
         "required_phrases": [item.get("phrase", "") for item in required],
         "knowledge": definitions,
+        "required_knowledge_ids": required_knowledge_ids,
         "dependency_order": [item.get("id") for item in reversed(definitions) if item.get("id") is not None],
         "required_schema": required_schema,
         "missing_schema_columns": missing_schema_columns,
@@ -1053,6 +1069,37 @@ def prepare_knowledge_context(
         "missing_phrases": completeness.get("missing_phrases", []),
         "suggested_knowledge": completeness.get("suggested_knowledge", []),
     }
+    # Later exploratory retrieval may add evidence, but must not replace the
+    # KB requirements established from the original task.
+    previous = tool_context.state.get("prepared_knowledge_context")
+    if isinstance(previous, dict):
+        merged_knowledge = []
+        seen_knowledge = set()
+        for item in (previous.get("knowledge", []) or []) + definitions:
+            identity = (
+                str(item.get("id")) if item.get("id") is not None
+                else str(item.get("name", "")).lower()
+            )
+            if identity not in seen_knowledge:
+                seen_knowledge.add(identity)
+                merged_knowledge.append(item)
+        result.update({
+            "knowledge": merged_knowledge,
+            "required_phrases": previous.get("required_phrases", result["required_phrases"]),
+            "required_knowledge_ids": previous.get(
+                "required_knowledge_ids", required_knowledge_ids
+            ),
+            "dependency_order": previous.get("dependency_order", result["dependency_order"]),
+            "required_schema": previous.get("required_schema", result["required_schema"]),
+            "missing_schema_columns": previous.get(
+                "missing_schema_columns", result["missing_schema_columns"]
+            ),
+            "complete": previous.get("complete", result["complete"]),
+            "missing_phrases": previous.get("missing_phrases", result["missing_phrases"]),
+            "suggested_knowledge": previous.get(
+                "suggested_knowledge", result["suggested_knowledge"]
+            ),
+        })
     tool_context.state["prepared_knowledge_context"] = result
     return json.dumps(result, separators=(",", ":"))
 
@@ -1296,10 +1343,191 @@ def _physical_table_and_alias(value) -> tuple[str, str]:
     return table, alias.strip('"').lower()
 
 
+def _find_management_sql_text(value) -> str:
+    """Find SQL-like text recursively without depending on payload field names."""
+    candidates = []
+
+    recognized = re.compile(
+        r"\b(?:CREATE(?:\s+OR\s+REPLACE)?\s+(?:FUNCTION|TRIGGER|TYPE|INDEX|VIEW|TABLE)|"
+        r"ALTER\s+TABLE|UPDATE\s+[\w.]|DELETE\s+FROM|INSERT\s+INTO|DO\s+\$)", re.I,
+    )
+
+    def visit(item, field_name=""):
+        if isinstance(item, dict):
+            for key, nested in item.items():
+                visit(nested, str(key).lower())
+        elif isinstance(item, list):
+            for nested in item:
+                visit(nested, field_name)
+        elif isinstance(item, str) and re.search(
+            r"(?:^|[;\s])(?:CREATE|ALTER|UPDATE|DELETE|INSERT|DO)\b", item, re.I,
+        ):
+            text = item.strip()
+            candidates.append((
+                bool(recognized.search(text)),
+                field_name in {"sql", "statement", "statement_template", "sql_intent", "query"},
+                bool(re.match(r"^(?:CREATE|ALTER|UPDATE|DELETE|INSERT|DO)\b", text, re.I)),
+                len(text),
+                text,
+            ))
+
+    visit(value)
+    return max(candidates, default=(False, False, False, 0, ""))[-1]
+
+
+def _management_statement_record(value, index: int) -> dict:
+    """Reduce SQL-like statement templates to compact semantic requirements."""
+    if isinstance(value, dict):
+        item = dict(value)
+        operation = (
+            item.get("operation") or item.get("statement_type") or item.get("sql_kind")
+            or item.get("object_type") or item.get("type") or ""
+        )
+        operation = re.sub(r"[\s-]+", "_", str(operation).upper())
+        operation_aliases = {
+            "SQL": "", "DO_BLOCK_UPDATE": "DO_BLOCK", "DO": "DO_BLOCK",
+            "ALTER": "ALTER_TABLE", "CREATE_PROCEDURE": "CREATE_FUNCTION",
+            "UPDATE_BACKFILL": "UPDATE", "ALTER_TABLE_ADD_COLUMN": "ALTER_TABLE",
+            "ALTER_TABLE_ALTER_COLUMN": "ALTER_TABLE",
+        }
+        operation = operation_aliases.get(operation, operation)
+        target = (
+            item.get("target") or item.get("object_name") or item.get("name")
+            or item.get("identifier") or ""
+        )
+        sql_template = _find_management_sql_text(item)
+        if sql_template and (not operation or not target):
+            parsed = _management_statement_record(sql_template, index)
+            operation = operation or parsed.get("operation", "")
+            target = target or parsed.get("target", "")
+        item["operation"] = operation or "STATEMENT"
+        item["target"] = str(target)
+        details = item.get("details") if isinstance(item.get("details"), dict) else {}
+        item.setdefault("action", details.get("action") or details.get("statement_action"))
+        item.setdefault(
+            "object",
+            item.get("column") or item.get("object_name") or details.get("column") or details.get("object"),
+        )
+        item.setdefault("depends_on", [] if index == 0 else [index - 1])
+        return item
+    text = str(value).strip()
+    patterns = (
+        ("CREATE_FUNCTION", r"create(?:\s+or\s+replace)?\s+function\s+([\w.]+)"),
+        ("CREATE_TRIGGER", r"create\s+trigger\s+([\w.]+)"),
+        ("CREATE_TYPE", r"create\s+type\s+([\w.]+)"),
+        ("CREATE_INDEX", r"create(?:\s+unique)?\s+index(?:\s+if\s+not\s+exists)?\s+([\w.]+)"),
+        ("ALTER_TABLE", r"alter\s+table(?:\s+if\s+exists)?\s+([\w.]+)"),
+        ("DO_BLOCK", r"\bdo\b"),
+        ("UPDATE", r"update\s+([\w.]+)"),
+        ("DELETE", r"delete\s+from\s+([\w.]+)"),
+        ("INSERT", r"insert\s+into\s+([\w.]+)"),
+    )
+    for operation, pattern in patterns:
+        match = re.search(pattern, text, re.I)
+        if match:
+            target = match.group(1) if match.lastindex else ""
+            if operation == "DO_BLOCK":
+                update = re.search(r"\bupdate\s+([\w.]+)", text, re.I)
+                target = update.group(1) if update else ""
+            record = {
+                "operation": operation, "target": target,
+                "depends_on": [] if index == 0 else [index - 1],
+            }
+            column_match = re.search(
+                r"\b(?:add|alter|drop)\s+column(?:\s+if\s+(?:not\s+)?exists)?\s+([\w.]+)",
+                text, re.I,
+            )
+            if column_match:
+                record["action"] = re.search(r"\b(add|alter|drop)\b", text, re.I).group(1).upper() + "_COLUMN"
+                record["object"] = column_match.group(1)
+            return record
+    return {"operation": "STATEMENT", "target": "", "depends_on": [] if index == 0 else [index - 1]}
+
+
 def _normalize_plan(plan: dict, category: str) -> tuple[dict, list[str]]:
     """Accept common LLM field variants and store one canonical plan shape."""
     normalized = dict(plan)
     changes = []
+
+    if category == "Management":
+        operation = re.sub(r"[\s-]+", "_", str(normalized.get("operation", "")).strip().upper())
+        operation_aliases = {
+            "ALTER": "ALTER_TABLE", "CREATE_PROCEDURE": "CREATE_FUNCTION",
+        }
+        normalized["operation"] = operation_aliases.get(operation, operation)
+        raw_targets = normalized.get("target_objects") or normalized.get("targets") or []
+        if isinstance(raw_targets, (str, dict)):
+            raw_targets = [raw_targets]
+        targets = []
+        default_type = {
+            "ALTER_TABLE": "table", "UPDATE": "table", "DELETE": "table",
+            "INSERT": "table", "CREATE_TYPE": "type", "CREATE_FUNCTION": "function",
+            "CREATE_TRIGGER": "trigger", "CREATE_VIEW": "view", "CREATE_TABLE": "table",
+        }.get(normalized["operation"], "object")
+        for value in raw_targets:
+            if isinstance(value, dict):
+                name = value.get("name") or value.get("identifier") or value.get("target")
+                kind = value.get("type") or value.get("object_type") or default_type
+                if name:
+                    targets.append({**value, "type": str(kind).lower(), "name": str(name)})
+            elif value:
+                targets.append({"type": default_type, "name": str(value)})
+        normalized["target_objects"] = targets
+        if raw_targets and targets != raw_targets:
+            changes.append("target_objects normalized")
+        if "affected_row_conditions" not in normalized:
+            normalized["affected_row_conditions"] = (
+                normalized.get("population_constraints")
+                or normalized.get("conditions") or normalized.get("filters") or []
+            )
+        conditions = normalized.get("affected_row_conditions") or []
+        if isinstance(conditions, (str, dict)):
+            conditions = [conditions]
+        normalized["affected_row_conditions"] = [
+            value if isinstance(value, dict) else {
+                "phrase": "affected rows", "expression": str(value), "stage": "WHERE",
+            }
+            for value in conditions
+            if not (
+                isinstance(value, str)
+                and re.fullmatch(r"\s*(?:all|every)\s+(?:rows?|records?)(?:\s+in\s+[\w.]+)?\s*", value, re.I)
+            )
+        ]
+        normalized["affected_row_conditions"] = [
+            item for item in normalized["affected_row_conditions"]
+            if not (
+                isinstance(item, dict)
+                and re.fullmatch(
+                    r"\s*(?:all|every)\s+(?:rows?|records?)(?:\s+in\s+[\w.]+)?\s*",
+                    str(item.get("expression", item.get("predicate", ""))), re.I,
+                )
+            )
+        ]
+        for item in normalized["affected_row_conditions"]:
+            expression = str(item.get("expression", item.get("predicate", "")))
+            separator = re.search(r"(?<!:):(?!:)", expression)
+            if not separator:
+                continue
+            prefix = expression[:separator.start()]
+            suffix = expression[separator.end():]
+            sql_like = bool(
+                re.search(r"\b\w+\.\w+\b", suffix)
+                or re.search(r"(?:>=|<=|<>|!=|=|>|<|\bAND\b|\bOR\b)", suffix, re.I)
+            )
+            if sql_like:
+                if not item.get("phrase") or item.get("phrase") == "affected rows":
+                    item["phrase"] = prefix.strip()
+                item["expression"] = suffix.strip()
+        if "required_statements" not in normalized and normalized.get("statement_sequence"):
+            normalized["required_statements"] = normalized["statement_sequence"]
+            changes.append("statement_sequence->required_statements")
+        statements = normalized.get("required_statements") or []
+        if isinstance(statements, (str, dict)):
+            statements = [statements]
+        normalized["required_statements"] = [
+            _management_statement_record(value, index)
+            for index, value in enumerate(statements)
+        ]
 
     field_aliases = {
         "sources": "source_tables",
@@ -1401,7 +1629,7 @@ def _normalize_plan(plan: dict, category: str) -> tuple[dict, list[str]]:
             if isinstance(value, str) else value
             for value in normalized["global_filters"]
         ]
-    if "population_constraints" not in normalized:
+    if category == "Query" and "population_constraints" not in normalized:
         alternatives = normalized.get("entity_filters") or normalized.get("row_filters")
         if alternatives is None:
             alternatives = normalized.get("global_filters")
@@ -1414,7 +1642,7 @@ def _normalize_plan(plan: dict, category: str) -> tuple[dict, list[str]]:
         else:
             normalized["population_constraints"] = []
 
-    for field in ("calculations", "conditions"):
+    for field in ("calculations", "conditions", "affected_row_conditions"):
         items = []
         for value in normalized.get(field) or []:
             if not isinstance(value, dict):
@@ -1425,9 +1653,9 @@ def _normalize_plan(plan: dict, category: str) -> tuple[dict, list[str]]:
                 item["knowledge_id"] = item["kb_id"]
             if "knowledge_id" not in item and item.get("knowledge_ids"):
                 item["knowledge_id"] = item["knowledge_ids"][0]
-            if field == "conditions" and "expression" not in item:
+            if field in {"conditions", "affected_row_conditions"} and "expression" not in item:
                 item["expression"] = item.get("predicate", item.get("condition", item.get("filter", "")))
-            if field == "conditions" and not item.get("stage"):
+            if field in {"conditions", "affected_row_conditions"} and not item.get("stage"):
                 item["stage"] = (
                     "HAVING" if re.search(
                         r"\b(count|sum|avg|min|max|percentile_cont|percentile_disc)\s*\(",
@@ -1450,7 +1678,8 @@ def _normalize_plan(plan: dict, category: str) -> tuple[dict, list[str]]:
 
     if not normalized.get("steps"):
         steps = ["read grounded sources and apply joins"]
-        if normalized.get("conditions") or normalized.get("population_constraints"):
+        if (normalized.get("conditions") or normalized.get("population_constraints")
+                or normalized.get("affected_row_conditions")):
             steps.append("apply row and group restrictions")
         if normalized.get("calculations"):
             steps.append("compute KB-backed expressions")
@@ -1581,6 +1810,27 @@ def _transitive_kb_ids(direct_ids: set[str], tool_context: ToolContext) -> set[s
     return used
 
 
+def _plan_knowledge_ids(plan: dict) -> set[str]:
+    """Collect KB IDs from Query fields and nested Management contracts."""
+    found = set()
+
+    def visit(value):
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key in {"knowledge_id", "kb_id"} and item is not None:
+                    found.add(str(item))
+                elif key == "knowledge_ids" and isinstance(item, list):
+                    found.update(str(kid) for kid in item if kid is not None)
+                else:
+                    visit(item)
+        elif isinstance(value, list):
+            for item in value:
+                visit(item)
+
+    visit(plan)
+    return found
+
+
 def _semantic_plan_contract(
     category: str, difficulty: str, plan: dict, context: dict, tool_context: ToolContext
 ) -> dict:
@@ -1595,7 +1845,9 @@ def _semantic_plan_contract(
         str(item.get("predicate", item.get("expression", "")))
         for item in (plan.get("population_constraints") or []) if isinstance(item, dict)
     ]
-    required_population = tool_context.state.get("required_population", [])
+    required_population = (
+        tool_context.state.get("required_population", []) if category == "Query" else []
+    )
     population_text = " ".join(populations).lower()
     required_population_covered = all(
         str(item.get("column", "")).lower() in population_text
@@ -1606,17 +1858,17 @@ def _semantic_plan_contract(
         f"{item.get('left', '')}={item.get('right', '')}"
         for item in (plan.get("joins") or []) if isinstance(item, dict)
     ]
-    direct_kb = {
-        str(item.get("knowledge_id", item.get("kb_id")))
-        for field in ("calculations", "conditions", "output_columns")
-        for item in (plan.get(field) or []) if isinstance(item, dict)
-        if item.get("knowledge_id", item.get("kb_id")) is not None
-    }
+    direct_kb = _plan_knowledge_ids(plan)
     used_kb = _transitive_kb_ids(direct_kb, tool_context)
-    selected_kb = {
-        str(item.get("id")) for item in context.get("selected_knowledge", [])
-        if item.get("id") is not None
-    }
+    prepared_kb = tool_context.state.get("prepared_knowledge_context", {})
+    mandatory_ids = prepared_kb.get("required_knowledge_ids")
+    selected_kb = (
+        {str(value) for value in mandatory_ids}
+        if mandatory_ids is not None else {
+            str(item.get("id")) for item in context.get("selected_knowledge", [])
+            if item.get("id") is not None
+        }
+    )
     selected_edges = {
         frozenset((str(item.get("left", "")).lower(), str(item.get("right", "")).lower()))
         for item in context.get("selected_join_edges", [])
@@ -1774,22 +2026,57 @@ def validate_query_plan(tool_context: ToolContext) -> str:
         frozenset({str(edge.get("left", "")).lower(), str(edge.get("right", "")).lower()})
         for edge in context.get("selected_join_edges", [])
     }
-    selected_knowledge_ids = {
+    retrieved_knowledge_ids = {
         str(item.get("id")) for item in context.get("selected_knowledge", [])
         if item.get("id") is not None
     }
-    used_knowledge_ids = {
-        str(item.get("knowledge_id", item.get("kb_id")))
-        for field in ("calculations", "conditions", "output_columns")
-        for item in (plan.get(field) or []) if isinstance(item, dict)
-        if item.get("knowledge_id", item.get("kb_id")) is not None
-    }
+    mandatory_ids = tool_context.state.get(
+        "prepared_knowledge_context", {}
+    ).get("required_knowledge_ids")
+    selected_knowledge_ids = (
+        {str(value) for value in mandatory_ids}
+        if mandatory_ids is not None else retrieved_knowledge_ids
+    )
+    used_knowledge_ids = _plan_knowledge_ids(plan)
     used_knowledge_ids = _transitive_kb_ids(used_knowledge_ids, tool_context)
     for knowledge_id in sorted(selected_knowledge_ids - used_knowledge_ids):
         errors.append(f"Required knowledge ID is not used by a calculation or condition: {knowledge_id}")
 
+    knowledge_definitions = {
+        str(item.get("id")): str(item.get("definition", ""))
+        for item in tool_context.state.get("prepared_knowledge_context", {}).get(
+            "knowledge", []
+        )
+        if item.get("id") is not None
+    }
+
+    def reject_unrequested_formula_transforms(value):
+        if isinstance(value, dict):
+            knowledge_id = value.get("knowledge_id", value.get("kb_id"))
+            expression = next((
+                str(value.get(key, "")) for key in
+                ("expression", "predicate", "body", "definition") if value.get(key)
+            ), "")
+            definition = knowledge_definitions.get(str(knowledge_id), "")
+            if (
+                knowledge_id is not None and expression and definition
+                and re.search(r"\b(?:least|greatest)\s*\(", expression, re.I)
+                and not re.search(r"\b(?:least|greatest)\s*\(", definition, re.I)
+            ):
+                errors.append(
+                    f"Knowledge ID {knowledge_id} formula adds unrequested clamping; "
+                    "use the retrieved definition literally"
+                )
+            for item in value.values():
+                reject_unrequested_formula_transforms(item)
+        elif isinstance(value, list):
+            for item in value:
+                reject_unrequested_formula_transforms(item)
+
+    reject_unrequested_formula_transforms(plan)
+
     source_tables = [str(table).lower() for table in plan.get("source_tables", [])]
-    if not source_tables:
+    if category == "Query" and not source_tables:
         errors.append("source_tables must not be empty")
     for table in source_tables:
         if table not in selected_tables:
@@ -1807,10 +2094,25 @@ def validate_query_plan(tool_context: ToolContext) -> str:
 
     for calculation in plan.get("calculations", []) or []:
         if not calculation.get("expression"):
-            errors.append(f"Calculation requires an expression: {calculation}")
+            errors.append(
+                "Calculation requires an expression: "
+                f"{calculation.get('name', calculation.get('knowledge_id', 'unnamed'))}"
+            )
         knowledge_id = calculation.get("knowledge_id")
-        if knowledge_id is not None and str(knowledge_id) not in selected_knowledge_ids:
+        if knowledge_id is not None and str(knowledge_id) not in retrieved_knowledge_ids:
             errors.append(f"Calculation references unselected knowledge ID: {knowledge_id}")
+
+    if category == "Management" and plan.get("calculations"):
+        operation = str(plan.get("operation", "")).upper()
+        statement_operations = {
+            str(item.get("operation", "")).upper()
+            for item in (plan.get("required_statements") or [])
+            if isinstance(item, dict)
+        }
+        if operation.startswith("ALTER_TABLE") and "UPDATE" not in statement_operations:
+            errors.append(
+                "Calculated schema change requires an ordered UPDATE backfill statement"
+            )
 
     for condition in plan.get("conditions", []) or []:
         if not condition.get("expression"):
@@ -1820,7 +2122,11 @@ def validate_query_plan(tool_context: ToolContext) -> str:
 
     if category == "Query" and "population_constraints" not in plan:
         errors.append("Query plan must explicitly provide population_constraints (use [] when none)")
-    for constraint in plan.get("population_constraints", []) or []:
+    plan_constraints = (
+        plan.get("population_constraints", []) if category == "Query"
+        else plan.get("affected_row_conditions", [])
+    ) or []
+    for constraint in plan_constraints:
         if not isinstance(constraint, dict):
             errors.append(f"Population constraint must be an object: {constraint}")
             continue
@@ -1834,7 +2140,13 @@ def validate_query_plan(tool_context: ToolContext) -> str:
         for ref in refs:
             if ref not in selected_columns:
                 errors.append(f"Population constraint column is not selected: {ref}")
-        literals = re.findall(r"'([^']+)'", predicate)
+        # PostgreSQL JSON operators quote both path keys and compared values.
+        # Only the latter are categorical values that need data inspection.
+        literals = [
+            match.group(1)
+            for match in re.finditer(r"'([^']+)'", predicate)
+            if not re.search(r"->>?\s*$", predicate[:match.start()])
+        ]
         if literals:
             inspection = tool_context.state.get("last_database_inspection", {})
             cumulative = tool_context.state.get("database_inspections", {})
@@ -1880,10 +2192,12 @@ def validate_query_plan(tool_context: ToolContext) -> str:
 
     population_text = " ".join(
         str(item.get("predicate", item.get("expression", ""))).lower()
-        for item in (plan.get("population_constraints", []) or [])
+        for item in plan_constraints
         if isinstance(item, dict)
     )
-    for requirement in tool_context.state.get("required_population", []):
+    for requirement in (
+        tool_context.state.get("required_population", []) if category == "Query" else []
+    ):
         column = str(requirement.get("column", "")).lower()
         value = str(requirement.get("value", "")).lower()
         if column not in population_text or value not in population_text:
@@ -1920,16 +2234,46 @@ def validate_query_plan(tool_context: ToolContext) -> str:
         if not plan.get("output_columns"):
             errors.append("Query plan requires output_columns")
     else:
-        operation = str(plan.get("operation", "")).upper()
+        operation = str(plan.get("operation", "")).upper().replace(" ", "_")
         if not operation:
             errors.append("Management plan requires an operation")
-        if not plan.get("target_objects"):
+        targets = plan.get("target_objects") or []
+        if not targets:
             errors.append("Management plan requires target_objects")
+        for target in targets:
+            if not isinstance(target, dict) or not target.get("type") or not target.get("name"):
+                errors.append(f"Management target requires type and name: {target}")
+        row_operations = {"UPDATE", "DELETE", "INSERT"}
         if operation == "UPDATE" and not plan.get("mutations"):
             errors.append("UPDATE plan requires mutations")
-        if operation in {"CREATE FUNCTION", "CREATE PROCEDURE", "CREATE TRIGGER"}:
-            if not plan.get("object_definitions"):
-                errors.append(f"{operation} plan requires object_definitions")
+        if operation == "INSERT" and not (
+            plan.get("mutations") or plan.get("insert_columns") or plan.get("values")
+            or source_tables
+        ):
+            errors.append("INSERT plan requires values, mutations, columns, or a source query")
+        if operation in {"UPDATE", "DELETE"} and not plan.get("affected_row_conditions"):
+            warnings.append(f"{operation} has no affected_row_conditions; verify all rows are intended")
+        if operation == "ALTER_TABLE" and not (
+            plan.get("columns") or plan.get("schema_changes") or plan.get("actions")
+        ):
+            errors.append("ALTER_TABLE plan requires columns, schema_changes, or actions")
+        if operation == "CREATE_TYPE" and not (
+            plan.get("enum_values") or plan.get("values") or plan.get("object_definitions")
+        ):
+            errors.append("CREATE_TYPE plan requires enum values or an object definition")
+        if operation == "CREATE_FUNCTION" and not (
+            plan.get("body_requirements") or plan.get("object_definitions")
+        ):
+            errors.append("CREATE_FUNCTION plan requires body_requirements or object_definitions")
+        if operation == "CREATE_TRIGGER" and not (
+            plan.get("timing") and plan.get("event") and
+            (plan.get("called_function") or plan.get("object_definitions"))
+        ):
+            errors.append("CREATE_TRIGGER plan requires timing, event, and called function")
+        if len(targets) > 1 and not (
+            plan.get("required_statements") or plan.get("statement_sequence")
+        ):
+            errors.append("Multi-object Management plan requires ordered required_statements")
 
     if not plan.get("steps"):
         errors.append("Plan requires ordered decomposition steps")
@@ -1951,6 +2295,7 @@ def validate_query_plan(tool_context: ToolContext) -> str:
             errors.append(f"Semantic plan check failed: {check}")
 
     if errors:
+        errors = list(dict.fromkeys(errors))[:8]
         result = {
             "valid": False,
             "version": candidate["version"],
@@ -2014,6 +2359,22 @@ def validate_sql_to_plan(
 
     official = tool_context.state.get("query_plan")
     diagnoses = []
+    history = list(tool_context.state.get("sql_validation_history", []))
+    if history:
+        previous = history[-1]
+        if (
+            previous.get("valid") is False
+            and previous.get("retryable") is False
+            and int(previous.get("plan_version", -1)) == int(plan_version)
+        ):
+            return json.dumps({
+                "valid": False,
+                "plan_version": plan_version,
+                "diagnoses": previous.get("diagnoses", []),
+                "same_diagnosis_count": previous.get("same_diagnosis_count", 2),
+                "retryable": False,
+                "next": "revise_plan_once_or_stop",
+            }, separators=(",", ":"))
 
     def add_diagnosis(kind: str, message: str, component: str, change: str):
         diagnoses.append({
@@ -2042,7 +2403,15 @@ def validate_sql_to_plan(
         trees = []
     else:
         try:
-            trees = [tree for tree in parse(sql, dialect="postgres") if tree is not None]
+            parse_sql = sql
+            if official.get("category") == "Management":
+                # SQLGlot does not parse PL/pgSQL DO bodies and emits one warning
+                # per validation. Other Management checks use the original text.
+                parse_sql = re.sub(
+                    r"\bDO\s+(\$[A-Za-z_0-9]*\$).*?\1\s*;?",
+                    "SELECT 1;", parse_sql, flags=re.I | re.S,
+                )
+            trees = [tree for tree in parse(parse_sql, dialect="postgres") if tree is not None]
             if not trees:
                 raise ValueError("no SQL statement was parsed")
         except Exception as exc:
@@ -2069,7 +2438,7 @@ def validate_sql_to_plan(
             else expected_operation if expected_operation in root_types or ddl_command_matches
             else next(iter(root_types), "UNKNOWN")
         )
-        if expected_operation and actual_operation != expected_operation:
+        if category == "Query" and expected_operation and actual_operation != expected_operation:
             add_diagnosis(
                 "operation_mismatch",
                 f"The plan requires {expected_operation}, but the draft uses {actual_operation}.",
@@ -2094,20 +2463,21 @@ def validate_sql_to_plan(
                 "selected_tables", []
             )
         }
-        for table in sorted(actual_tables - preprocessing_tables):
-            add_diagnosis(
-                "ungrounded_table",
-                f"The draft references {table}, which is not in PREPROCESSING_CONTEXT.",
-                "source_tables",
-                "Use only grounded tables or return to preprocessing to add the required table.",
-            )
-        for table in sorted(planned_tables - actual_tables):
-            add_diagnosis(
-                "missing_planned_table",
-                f"The planned source table {table} is missing from the draft.",
-                "source_tables",
-                f"Add {table} using the relationship specified by QUERY_PLAN.",
-            )
+        if category == "Query":
+            for table in sorted(actual_tables - preprocessing_tables):
+                add_diagnosis(
+                    "ungrounded_table",
+                    f"The draft references {table}, which is not in PREPROCESSING_CONTEXT.",
+                    "source_tables",
+                    "Use only grounded tables or return to preprocessing to add the required table.",
+                )
+            for table in sorted(planned_tables - actual_tables):
+                add_diagnosis(
+                    "missing_planned_table",
+                    f"The planned source table {table} is missing from the draft.",
+                    "source_tables",
+                    f"Add {table} using the relationship specified by QUERY_PLAN.",
+                )
 
         actual_join_types = []
         for tree in trees:
@@ -2119,7 +2489,7 @@ def validate_sql_to_plan(
             str(join.get("type", "INNER")).upper().replace(" JOIN", "")
             for join in plan.get("joins", []) or []
         ]
-        if sorted(actual_join_types) != sorted(planned_join_types):
+        if category == "Query" and sorted(actual_join_types) != sorted(planned_join_types):
             add_diagnosis(
                 "join_type_mismatch",
                 f"Planned join types are {planned_join_types}, but draft join types are {actual_join_types}.",
@@ -2136,6 +2506,8 @@ def validate_sql_to_plan(
             ),
         }
         for field, present in structural_requirements.items():
+            if category != "Query":
+                break
             if bool(plan.get(field)) and not present:
                 add_diagnosis(
                     "missing_planned_structure",
@@ -2144,7 +2516,9 @@ def validate_sql_to_plan(
                     f"Implement the planned structure represented by {field}.",
                 )
 
-        sql_lower = sql.lower()
+        # Comments are explanatory only and cannot satisfy executable semantic
+        # contracts such as KB expressions or required statements.
+        sql_lower = re.sub(r"/\*.*?\*/|--[^\r\n]*", " ", sql, flags=re.S).lower()
         for output in plan.get("output_columns", []) or []:
             output_text = str(output).lower()
             if re.fullmatch(r"[\w]+\.[\w]+", output_text):
@@ -2211,13 +2585,165 @@ def validate_sql_to_plan(
                         f"output_columns[{index}].scale", "Multiply PERCENT_RANK by 100.",
                     )
         for target in plan.get("target_objects", []) or []:
-            target_text = str(target).lower()
-            if target_text not in sql_lower and target_text.split(".")[-1] not in sql_lower:
+            target_name = str(
+                target.get("name", "") if isinstance(target, dict) else target
+            ).lower().split(".")[-1].strip('"')
+            if target_name and not re.search(rf"\b{re.escape(target_name)}\b", sql_lower):
                 add_diagnosis(
                     "missing_target_object",
-                    f"The planned target object {target} is not represented in the draft.",
+                    f"The planned target {target_name} is not represented in the draft.",
                     "target_objects",
-                    f"Include the planned target object {target}.",
+                    f"Include the planned target {target_name}.",
+                )
+
+        if category == "Management":
+            operation = str(plan.get("operation", "")).upper().replace(" ", "_")
+            operation_markers = {
+                "UPDATE": r"\bupdate\b", "DELETE": r"\bdelete\s+from\b",
+                "INSERT": r"\binsert\s+into\b", "ALTER_TABLE": r"\balter\s+table\b",
+                "CREATE_TYPE": r"\bcreate\s+type\b",
+                "CREATE_FUNCTION": r"\bcreate(?:\s+or\s+replace)?\s+function\b",
+                "CREATE_TRIGGER": r"\bcreate\s+trigger\b",
+                "CREATE_VIEW": r"\bcreate(?:\s+or\s+replace)?\s+view\b",
+                "CREATE_TABLE": r"\bcreate\s+table\b",
+            }
+            marker = operation_markers.get(operation)
+            if marker and not re.search(marker, sql_lower):
+                add_diagnosis(
+                    "operation_mismatch", f"Draft does not implement {operation}.",
+                    "operation", f"Generate the planned {operation} statement.",
+                )
+            required_fragments = {
+                "CREATE_FUNCTION": ("returns", "language"),
+                "CREATE_TRIGGER": (" on ", "execute"),
+            }.get(operation, ())
+            for fragment in required_fragments:
+                if fragment not in sql_lower:
+                    add_diagnosis(
+                        "missing_management_clause",
+                        f"{operation} is missing required clause: {fragment.strip()}.",
+                        "object_definitions", f"Add the required {fragment.strip()} clause.",
+                    )
+
+            added_columns = re.findall(
+                r"\balter\s+table\s+([\w.]+).*?\badd\s+column(?:\s+if\s+not\s+exists)?\s+([\w.]+)",
+                sql_lower, re.I | re.S,
+            )
+            duplicate_additions = sorted({
+                f"{table}.{column}" for table, column in added_columns
+                if added_columns.count((table, column)) > 1
+            })
+            if duplicate_additions:
+                add_diagnosis(
+                    "duplicate_schema_change",
+                    f"Columns are added more than once: {duplicate_additions}",
+                    "required_statements",
+                    "Add each schema object exactly once.",
+                )
+            if (
+                added_columns
+                and re.search(r"\balter\s+column\s+[\w.]+\s+set\s+not\s+null\b", sql_lower)
+                and not re.search(r"\bupdate\s+[\w.]+\s+set\b", sql_lower)
+            ):
+                add_diagnosis(
+                    "unsafe_not_null_transition",
+                    "A newly added column is made NOT NULL without an UPDATE backfill.",
+                    "required_statements",
+                    "Backfill existing rows before applying NOT NULL.",
+                )
+
+            required_tokens = set()
+
+            def add_contract_tokens(value, keys):
+                if isinstance(value, dict):
+                    for key, item in value.items():
+                        if key in keys and isinstance(item, (str, int, float, bool)):
+                            required_tokens.update(re.findall(r"[a-zA-Z_]\w*|\d+(?:\.\d+)?", str(item).lower()))
+                        elif isinstance(item, (dict, list)):
+                            add_contract_tokens(item, keys)
+                elif isinstance(value, list):
+                    for item in value:
+                        add_contract_tokens(item, keys)
+
+            if operation in {"UPDATE", "INSERT"}:
+                add_contract_tokens(plan.get("mutations", []), {"target", "column", "name"})
+            if operation == "ALTER_TABLE":
+                add_contract_tokens(
+                    plan.get("columns") or plan.get("schema_changes") or plan.get("actions") or [],
+                    {"action", "column", "name", "type", "default", "constraint"},
+                )
+            if operation == "CREATE_TYPE":
+                add_contract_tokens(
+                    plan.get("enum_values") or plan.get("values") or [], {"name", "value"},
+                )
+                for value in plan.get("enum_values") or plan.get("values") or []:
+                    if isinstance(value, (str, int, float)):
+                        required_tokens.add(str(value).lower())
+            if operation == "CREATE_FUNCTION":
+                add_contract_tokens(plan.get("parameters", []), {"name", "type"})
+                add_contract_tokens(plan.get("return_contract", {}), {"type", "name"})
+                if plan.get("language"):
+                    required_tokens.add(str(plan["language"]).lower())
+            if operation == "CREATE_TRIGGER":
+                for field in ("timing", "event", "called_function", "target_table"):
+                    if plan.get(field):
+                        required_tokens.update(re.findall(r"[a-zA-Z_]\w*", str(plan[field]).lower()))
+            ignored_contract_tokens = {
+                "add", "column", "constraint", "default", "set", "table", "type",
+                "function", "trigger", "true", "false", "numeric", "text", "boolean",
+                "integer", "returns", "language",
+            }
+            missing_contract_tokens = sorted(
+                token for token in required_tokens - ignored_contract_tokens
+                if not re.search(rf"\b{re.escape(token)}\b", sql_lower)
+            )
+            if missing_contract_tokens:
+                add_diagnosis(
+                    "management_contract_mismatch",
+                    f"Management draft is missing contract terms: {missing_contract_tokens[:12]}",
+                    "management_contract", "Implement the named operation-specific fields.",
+                )
+            statements = plan.get("required_statements") or plan.get("statement_sequence") or []
+            positions = []
+            search_cursor = 0
+            for statement in statements:
+                if isinstance(statement, dict):
+                    name = str(statement.get("name") or statement.get("target") or "").lower()
+                    operation_name = str(statement.get("operation") or statement.get("type") or "").upper()
+                else:
+                    name, operation_name = str(statement).lower(), "STATEMENT"
+                statement_markers = {
+                    "CREATE_FUNCTION": r"create(?:\s+or\s+replace)?\s+function",
+                    "CREATE_TRIGGER": r"create\s+trigger", "CREATE_TYPE": r"create\s+type",
+                    "CREATE_INDEX": r"create(?:\s+unique)?\s+index",
+                    "ALTER_TABLE": r"alter\s+table", "UPDATE": r"\bupdate\b",
+                    "DELETE": r"delete\s+from", "INSERT": r"insert\s+into",
+                    "DO_BLOCK": r"\bdo\b",
+                }
+                marker_match = re.search(
+                    statement_markers.get(operation_name, r"(?!)"),
+                    sql_lower[search_cursor:],
+                )
+                if marker_match:
+                    marker_start = search_cursor + marker_match.start()
+                else:
+                    marker_start = -1
+                position = marker_start
+                if position >= 0 and name:
+                    target_position = sql_lower.find(name.split(".")[-1], position)
+                    position = target_position if target_position >= 0 else -1
+                if position < 0:
+                    add_diagnosis(
+                        "missing_required_statement", f"Required statement is missing: {statement}",
+                        "required_statements", "Add every required Management statement.",
+                    )
+                else:
+                    positions.append(position)
+                    search_cursor = position + max(1, len(name.split(".")[-1]))
+            if positions != sorted(positions):
+                add_diagnosis(
+                    "statement_order_mismatch", "Management statements are not in dependency order.",
+                    "required_statements", "Emit required statements in planned dependency order.",
                 )
 
         calculation_expressions = {
@@ -2242,14 +2768,26 @@ def validate_sql_to_plan(
             "when", "then", "else", "end", "sqrt", "log", "abs", "power",
         } | planned_tables
 
-        for field in ("calculations", "conditions", "output_columns"):
-            for item in plan.get(field, []) or []:
+        kb_fields = (
+            "calculations", "conditions", "output_columns", "affected_row_conditions",
+            "mutations", "body_requirements", "object_definitions",
+        )
+        for field in kb_fields:
+            raw_items = plan.get(field, []) or []
+            if isinstance(raw_items, dict):
+                raw_items = [raw_items]
+            for item in raw_items:
                 if not isinstance(item, dict) or item.get("knowledge_id") is None:
                     continue
-                expression = expand_calculations(str(item.get("expression", "")))
+                expression = expand_calculations(str(
+                    item.get("expression", item.get("predicate", item.get("body", item.get("definition", ""))))
+                ))
+                # Symbolic plan helpers may be implemented with equivalent SQL
+                # expressions. Validate their arguments/constants, not invented names.
+                helper_names = set(re.findall(r"\b([a-zA-Z_]\w*)\s*\(", expression))
                 required = set(re.findall(
                     r"\b[a-zA-Z_][\w]*\b|\b\d+(?:\.\d+)?\b", expression
-                )) - ignored_expression_tokens
+                )) - ignored_expression_tokens - helper_names
                 missing = sorted(token for token in required if token not in sql_lower)
                 if missing:
                     add_diagnosis(
@@ -2276,11 +2814,17 @@ def validate_sql_to_plan(
                     "Apply the condition inside only the named aggregate output.",
                 )
 
-        population_constraints = plan.get("population_constraints", []) or []
+        population_constraints = (
+            plan.get("population_constraints", []) if category == "Query"
+            else plan.get("affected_row_conditions", [])
+        ) or []
         where_sql = " ".join(
             where.sql(dialect="postgres").lower()
             for tree in trees for where in tree.find_all(exp.Where)
         )
+        if category == "Management":
+            # PL/pgSQL bodies are often opaque strings to the outer SQL parser.
+            where_sql = sql_lower
         for constraint in population_constraints:
             if not isinstance(constraint, dict):
                 continue
@@ -2309,9 +2853,9 @@ def validate_sql_to_plan(
             if missing:
                 add_diagnosis(
                     "population_constraint_missing",
-                    f"Population restriction '{constraint.get('phrase', '')}' is missing from WHERE.",
-                    "population_constraints",
-                    "Add the grounded population predicate without applying it only to one output.",
+                    f"Affected-row restriction '{constraint.get('phrase', '')}' is missing.",
+                    "population_constraints" if category == "Query" else "affected_row_conditions",
+                    "Add the grounded predicate in the correct statement or function body.",
                 )
                 diagnoses[-1].update({
                     "expected_predicate": expanded_predicate[:500],
@@ -2319,8 +2863,12 @@ def validate_sql_to_plan(
                     "observed_where": where_sql[:500],
                 })
 
+    if diagnoses:
+        diagnoses = list({
+            (item.get("code"), item.get("path")): item
+            for item in diagnoses
+        }.values())[:6]
 
-    history = list(tool_context.state.get("sql_validation_history", []))
     sql_version = len(history) + 1
     record = {
         "sql_version": sql_version,
@@ -2329,10 +2877,6 @@ def validate_sql_to_plan(
         "valid": not diagnoses,
         "diagnoses": diagnoses,
     }
-    history.append(record)
-    tool_context.state["sql_validation_history"] = history
-    tool_context.state["sql_generation_completed"] = not diagnoses
-
     if diagnoses:
         signature = tuple(sorted(
             (item.get("code", item.get("type", "")), item.get("path", ""))
@@ -2343,17 +2887,31 @@ def validate_sql_to_plan(
                 (item.get("code", item.get("type", "")), item.get("path", item.get("plan_component", "")))
                 for item in record.get("diagnoses", [])
             )) == signature
-            for record in history[:-1]
+            for previous_record in history
+            if tuple(sorted(
+                (item.get("code", item.get("type", "")), item.get("path", item.get("plan_component", "")))
+                for item in previous_record.get("diagnoses", [])
+            )) == signature
         )
+        record["same_diagnosis_count"] = same_diagnosis_count
+        record["retryable"] = same_diagnosis_count < 2
+        history.append(record)
+        tool_context.state["sql_validation_history"] = history
+        tool_context.state["sql_generation_completed"] = False
         return json.dumps({
             "valid": False,
             "sql_version": sql_version,
             "plan_version": plan_version,
             "diagnoses": diagnoses,
             "same_diagnosis_count": same_diagnosis_count,
-            "next": "revise_plan" if same_diagnosis_count >= 2 else "revise_sql",
+            "retryable": same_diagnosis_count < 2,
+            "next": "stop_repeating_validation" if same_diagnosis_count >= 2 else "revise_sql",
         }, separators=(",", ":"))
 
+    record["retryable"] = False
+    history.append(record)
+    tool_context.state["sql_validation_history"] = history
+    tool_context.state["sql_generation_completed"] = True
     tool_context.state["draft_sql"] = sql
     tool_context.state["draft_sql_version"] = sql_version
     tool_context.state["draft_sql_plan_version"] = plan_version
