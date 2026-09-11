@@ -22,7 +22,10 @@ def _items(value: Any) -> list[str]:
 def final_attempted_sql(trajectory: Any) -> str | None:
     """Use final submitted SQL, or the last executed SQL when no submission exists."""
     calls = trajectory if isinstance(trajectory, list) else []
-    for tool_name in ("submit_sql", "execute_sql"):
+    for tool_name in (
+        "submit_validated_sql", "submit_sql",
+        "execute_validated_sql", "execute_sql",
+    ):
         for call in reversed(calls):
             if call.get("tool") == tool_name:
                 sql = (call.get("args") or {}).get("sql")
@@ -92,6 +95,42 @@ def sql_schema_elements(value: Any) -> tuple[set[str], set[tuple[str, str]]]:
     return tables, join_edges
 
 
+def sql_columns(value: Any) -> set[str]:
+    """Return canonical column references from SQL.
+
+    Qualified columns are resolved from aliases to physical table names. CTE
+    output references are excluded because their underlying physical columns
+    are collected inside the CTE. Unqualified references use ``*.column`` so
+    equivalent unqualified references remain comparable.
+    """
+    columns: set[str] = set()
+    for tree in _parse_all(value):
+        cte_names = {
+            cte.alias_or_name.lower()
+            for cte in tree.find_all(exp.CTE)
+            if cte.alias_or_name
+        }
+        alias_map: dict[str, str] = {}
+        for table in tree.find_all(exp.Table):
+            name = table.name.lower() if table.name else ""
+            if not name or name in cte_names:
+                continue
+            alias_map[name] = name
+            if table.alias_or_name:
+                alias_map[table.alias_or_name.lower()] = name
+        for column in tree.find_all(exp.Column):
+            if not column.name:
+                continue
+            if not column.table:
+                columns.add(f"*.{column.name.lower()}")
+                continue
+            qualifier = column.table.lower()
+            if qualifier in cte_names:
+                continue
+            columns.add(f"{alias_map.get(qualifier, qualifier)}.{column.name.lower()}")
+    return columns
+
+
 def _response_id(response: Any) -> int | str | None:
     if isinstance(response, dict):
         payload = response
@@ -119,6 +158,23 @@ def selected_kb_ids(trajectory: Any) -> set[int | str]:
             knowledge_id = _response_id(call.get("result"))
             if knowledge_id is not None:
                 selected.add(knowledge_id)
+        elif call.get("tool") == "prepare_knowledge_context":
+            # Variants 1 and 3 return the retrieved definitions together in one
+            # compact response instead of calling get_knowledge_definition once
+            # per entry. Count only definitions actually returned under
+            # ``knowledge``; suggested or merely required IDs are not retrievals.
+            payload = call.get("result")
+            if not isinstance(payload, dict):
+                try:
+                    payload = json.loads(str(payload or ""))
+                except (json.JSONDecodeError, TypeError):
+                    payload = {}
+            if isinstance(payload, dict) and isinstance(payload.get("result"), dict):
+                payload = payload["result"]
+            for item in payload.get("knowledge", []) if isinstance(payload, dict) else []:
+                knowledge_id = _response_id(item)
+                if knowledge_id is not None:
+                    selected.add(knowledge_id)
     return selected
 
 

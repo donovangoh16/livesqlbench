@@ -11,6 +11,7 @@ from schema_linking_metrics import (
     _set_scores,
     final_attempted_sql,
     selected_kb_ids,
+    sql_columns,
     sql_schema_elements,
 )
 
@@ -82,12 +83,45 @@ def _sql(call: dict | None) -> str | None:
     return str((call.get("args") or {}).get("sql")) if call and (call.get("args") or {}).get("sql") else None
 
 
+def _state_backed_sql(call: dict | None, all_calls: list[dict]) -> str | None:
+    """Resolve SQL for compact state-backed execute/submit tools.
+
+    Their arguments are intentionally empty in variants 1 and 3; the SQL is
+    the most recent candidate accepted by ``validate_sql_to_plan``.
+    """
+    direct = _sql(call)
+    if direct or call is None:
+        return direct
+    try:
+        call_index = next(i for i, item in enumerate(all_calls) if item is call)
+    except StopIteration:
+        return None
+    for prior in reversed(all_calls[:call_index]):
+        if prior.get("tool") == "validate_sql_to_plan" and _sql(prior):
+            return _sql(prior)
+    return None
+
+
 def _execution_succeeded(call: dict | None) -> bool:
     if not call:
         return False
-    result = str(call.get("result") or "").lower()
+    raw_result = call.get("result")
+    result = str(raw_result or "").lower()
     error_markers = ("sql error:", "error calling db environment", "execution timed out")
-    return not any(marker in result for marker in error_markers)
+    if any(marker in result for marker in error_markers):
+        return False
+    if isinstance(raw_result, str):
+        import json
+        try:
+            raw_result = json.loads(raw_result)
+        except (json.JSONDecodeError, TypeError):
+            raw_result = None
+    if isinstance(raw_result, dict):
+        if raw_result.get("success") is False or raw_result.get("ok") is False:
+            return False
+        if raw_result.get("error") and raw_result.get("success") is not True:
+            return False
+    return True
 
 
 def _parse_succeeded(sql: str | None) -> bool:
@@ -96,6 +130,22 @@ def _parse_succeeded(sql: str | None) -> bool:
     from schema_linking_metrics import _parse_all
 
     return bool(_parse_all(sql))
+
+
+def _validation_succeeded(call: dict | None) -> bool:
+    """Read the compact validator response without depending on formatting."""
+    if not call:
+        return False
+    raw = call.get("result")
+    if isinstance(raw, str):
+        import json
+        try:
+            raw = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return '"valid": true' in raw.lower() or "'valid': true" in raw.lower()
+    if isinstance(raw, dict) and isinstance(raw.get("result"), dict):
+        raw = raw["result"]
+    return isinstance(raw, dict) and raw.get("valid") is True
 
 
 def _structural_features(sql: str | None) -> set[str]:
@@ -136,23 +186,34 @@ def _structural_features(sql: str | None) -> set[str]:
 def task_phase_metrics(row: pd.Series) -> pd.Series:
     grouped = group_trajectory(row.get("tool_trajectory"))
     preprocessing = grouped["preprocessing"]
-    first_call = grouped["sql_generation"][0] if grouped["sql_generation"] else None
-    first_sql = _sql(first_call)
+    all_calls = row.get("tool_trajectory") if isinstance(row.get("tool_trajectory"), list) else []
+    # A validation call can precede execution in variants 1 and 3. The common
+    # initial SQL artifact is the first actual execution, not the validator.
+    first_call = next((c for c in all_calls if c.get("tool") in EXECUTION_TOOLS), None)
+    first_candidate = first_call or next(
+        (c for c in all_calls if c.get("tool") == "validate_sql_to_plan"), None
+    )
+    first_sql = _state_backed_sql(first_candidate, all_calls) or _sql(first_candidate)
     postprocessing_calls = grouped["postprocessing"]
     later_executes = [
         call for call in postprocessing_calls if call.get("tool") in EXECUTION_TOOLS
     ]
     error_diagnoses = [
         call for call in postprocessing_calls
-        if call.get("tool") == "diagnose_execution_error"
+        if call.get("tool") in POSTPROCESSING_TOOLS
     ]
-    all_calls = row.get("tool_trajectory") if isinstance(row.get("tool_trajectory"), list) else []
     submissions = [c for c in all_calls if c.get("tool") in SUBMISSION_TOOLS]
-    final_sql = _sql(submissions[-1]) if submissions else final_attempted_sql(row.get("tool_trajectory"))
+    final_sql = (
+        _state_backed_sql(submissions[-1], all_calls)
+        if submissions else final_attempted_sql(row.get("tool_trajectory"))
+    )
 
     ground_truth_tables, ground_truth_joins = sql_schema_elements(row.get("sol_sql"))
     initial_tables, initial_joins = sql_schema_elements(first_sql)
     final_tables, final_joins = sql_schema_elements(final_sql)
+    ground_truth_columns = sql_columns(row.get("sol_sql"))
+    initial_columns = sql_columns(first_sql)
+    final_columns = sql_columns(final_sql)
     expected_kb = {str(value) for value in (row.get("external_knowledge") or [])}
     retrieved_kb = {str(value) for value in selected_kb_ids(preprocessing)}
     plan_kb = set()
@@ -196,6 +257,15 @@ def task_phase_metrics(row: pd.Series) -> pd.Series:
         call.get("tool") in {"generate_query_plan", "generate_and_validate_query_plan"}
         for call in all_calls
     )
+    validation_calls = [
+        call for call in all_calls if call.get("tool") == "validate_sql_to_plan"
+    ]
+    first_validation_rejected = bool(validation_calls) and not _validation_succeeded(
+        validation_calls[0]
+    )
+    validation_revision_count = (
+        max(0, len(validation_calls) - 1) if first_validation_rejected else 0
+    )
     metrics: dict[str, Any] = {
         "phase_groups": grouped,
         "preprocessing_call_count": len(preprocessing),
@@ -211,7 +281,8 @@ def task_phase_metrics(row: pd.Series) -> pd.Series:
             + counts["get_selected_schema"] > 0
         ),
         "column_metadata_retrieved": (
-            counts["get_all_column_meanings"] + counts["get_column_meaning"] > 0
+            counts["get_all_column_meanings"] + counts["get_column_meaning"]
+            + counts["prepare_schema_context"] + counts["inspect_database"] > 0
         ),
         "knowledge_catalogue_retrieved": counts["get_all_external_knowledge_names"] > 0,
         "initial_sql": first_sql,
@@ -248,7 +319,15 @@ def task_phase_metrics(row: pd.Series) -> pd.Series:
         "planning_retry_count": max(0, planning_attempts - 1),
         "sql_validation_retry_count": max(
             0,
-            sum(call.get("tool") == "validate_sql_to_plan" for call in all_calls) - 1,
+            len(validation_calls) - 1,
+        ),
+        "validation_present": bool(validation_calls),
+        "initial_validation_rejected": first_validation_rejected,
+        "validation_revision_attempted": bool(validation_revision_count),
+        "validation_revision_count": validation_revision_count,
+        "validation_rejection_resolved": (
+            first_validation_rejected
+            and any(_validation_succeeded(call) for call in validation_calls[1:])
         ),
     }
     metrics.update(_set_scores(retrieved_kb, expected_kb, "phase_kb"))
@@ -261,9 +340,11 @@ def task_phase_metrics(row: pd.Series) -> pd.Series:
         retrieved_kb == expected_kb == plan_kb == sql_kb
     )
     metrics.update(_set_scores(initial_tables, ground_truth_tables, "initial_table"))
+    metrics.update(_set_scores(initial_columns, ground_truth_columns, "initial_column"))
     metrics.update(_set_scores(initial_joins, ground_truth_joins, "initial_join_path"))
     metrics.update(_set_scores(initial_features, ground_truth_features, "initial_plan_structure"))
     metrics.update(_set_scores(final_tables, ground_truth_tables, "final_table"))
+    metrics.update(_set_scores(final_columns, ground_truth_columns, "final_column"))
     metrics.update(_set_scores(final_joins, ground_truth_joins, "final_join_path"))
     metrics["plan_structure_exact_match"] = initial_features == ground_truth_features
     metrics["final_structure_exact_match"] = final_features == ground_truth_features
