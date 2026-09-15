@@ -82,6 +82,57 @@ class FinalizePreprocessingContextTests(unittest.TestCase):
     @patch("system_agent.tools._knowledge_names", return_value=[])
     @patch("system_agent.tools._post_json", return_value={"schema": ""})
     @patch("system_agent.tools._column_metadata")
+    def test_management_planned_new_column_need_not_exist(
+        self, metadata, _post_json, _knowledge_names,
+    ):
+        metadata.return_value = {"db|customers|id": "Primary key"}
+        context = SimpleNamespace(state={"task_category": "Management"})
+        result = json.loads(finalize_preprocessing_context(
+            selected_tables=["customers"],
+            selected_columns=[
+                {"table": "customers", "column": "id", "role": "key"},
+                {"table": "customers", "column": "segment", "role": "new_column_target"},
+            ],
+            selected_join_edges=[], required_knowledge_phrases=[],
+            selected_knowledge=[], unresolved_items=[], tool_context=context,
+        ))
+        self.assertTrue(result["valid"], result.get("errors"))
+        planned = context.state["preprocessing_context"]["selected_columns"][1]
+        self.assertEqual(planned["status"], "planned_new_target")
+
+    @patch("system_agent.tools._knowledge_names", return_value=[])
+    @patch("system_agent.tools._post_json", return_value={"schema": ""})
+    @patch("system_agent.tools._column_metadata")
+    def test_legacy_inspection_backed_join_shape_is_normalized(
+        self, metadata, _post_json, _knowledge_names,
+    ):
+        metadata.return_value = {
+            "db|events|event_time": "Timestamp",
+            "db|snapshots|snapshot_time": "Timestamp",
+        }
+        context = SimpleNamespace(state={"database_inspections": {
+            "events.event_time": ["2025-01-01"],
+            "snapshots.snapshot_time": ["2025-01-01"],
+        }})
+        result = json.loads(finalize_preprocessing_context(
+            selected_tables=["events", "snapshots"],
+            selected_columns=[
+                {"table": "events", "column": "event_time", "role": "join"},
+                {"table": "snapshots", "column": "snapshot_time", "role": "join"},
+            ],
+            selected_join_edges=[{
+                "left": "events.event_time", "right": "snapshots.snapshot_time",
+                "evidence": "inspection_backed",
+                "inspection_note": "matching row counts and timestamp overlap",
+            }],
+            required_knowledge_phrases=[], selected_knowledge=[],
+            unresolved_items=[], tool_context=context,
+        ))
+        self.assertTrue(result["valid"], result.get("errors"))
+
+    @patch("system_agent.tools._knowledge_names", return_value=[])
+    @patch("system_agent.tools._post_json", return_value={"schema": ""})
+    @patch("system_agent.tools._column_metadata")
     def test_inspection_backed_non_fk_relationship_is_allowed(
         self, metadata, _post_json, _knowledge_names,
     ):

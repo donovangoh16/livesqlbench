@@ -4,7 +4,12 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from system_agent.tools import (
+    _bounded_inspection_sql,
+    _categorical_literals,
+    _compact_inspection_response,
     _generation_strategy,
+    _management_statement_record,
+    _required_population_from_inspection,
     diagnose_execution_error,
     execute_validated_sql,
     generate_and_validate_query_plan,
@@ -37,6 +42,55 @@ def valid_state():
 
 
 class QueryPlanToolTests(unittest.TestCase):
+    def test_json_paths_are_not_categorical_literals(self):
+        predicate = (
+            "payload->>'status' = 'Active' AND "
+            "jsonb_path_exists(payload, '$.channel ? (@ == \"Online\")') AND "
+            "payload #>> '{}' = 'Yes'"
+        )
+        self.assertEqual(_categorical_literals(predicate), ["Active", "Yes"])
+
+    def test_inspection_sql_is_bounded_without_raising_a_smaller_limit(self):
+        self.assertIn("LIMIT 12", _bounded_inspection_sql("SELECT * FROM vendors"))
+        self.assertIn("LIMIT 12", _bounded_inspection_sql("SELECT * FROM vendors LIMIT 500"))
+        self.assertIn("LIMIT 5", _bounded_inspection_sql("SELECT * FROM vendors LIMIT 5"))
+
+    def test_inspection_response_caps_rows_values_and_cells(self):
+        result = _compact_inspection_response({
+            "sample_rows": [{"payload": "x" * 1000} for _ in range(20)],
+            "values_by_column": {"payload": ["y" * 1000 for _ in range(30)]},
+        })
+        self.assertLessEqual(len(result["sample_rows"]), 3)
+        self.assertLessEqual(len(result["values_by_column"]["payload"]), 12)
+        self.assertLessEqual(len(result["values_by_column"]["payload"][0]), 160)
+        self.assertTrue(result["response_truncated"])
+
+    def test_system_catalog_values_do_not_become_population_requirements(self):
+        requirements = _required_population_from_inspection(
+            "Show active controllers",
+            {
+                "testsessions.devscope": ["Controller"],
+                "pg_type.typname": ["Controller"],
+                "information_schema.columns": ["Active"],
+            },
+        )
+        self.assertEqual(requirements, [{
+            "phrase": "Controller", "column": "testsessions.devscope",
+            "value": "Controller", "value_verified": True,
+        }])
+
+    def test_management_statement_variants_are_canonicalized(self):
+        function = _management_statement_record({
+            "statement_type": "CREATE OR REPLACE FUNCTION",
+            "object": "calculate_score",
+        }, 0)
+        view = _management_statement_record({
+            "operation": "create-or-replace-view", "name": "score_view",
+        }, 1)
+        self.assertEqual(function["operation"], "CREATE_FUNCTION")
+        self.assertEqual(function["target"], "calculate_score")
+        self.assertEqual(view["operation"], "CREATE_VIEW")
+
     def _validated_query_context(self):
         context = SimpleNamespace(state=valid_state())
         generate_query_plan("Query", {
@@ -357,6 +411,9 @@ class QueryPlanToolTests(unittest.TestCase):
         state["preprocessing_context"]["selected_columns"].append({
             "table": "bank_and_transactions", "column": "chaninvdatablock",
         })
+        state["preprocessing_context"]["selected_columns"].append({
+            "table": "bank_and_transactions", "column": "bankexpref",
+        })
         state["last_database_inspection"] = {"values": ["High", "Yes"]}
         context = SimpleNamespace(state=state)
         result = json.loads(generate_and_validate_query_plan("Query", {
@@ -402,6 +459,19 @@ class QueryPlanToolTests(unittest.TestCase):
         self.assertIn("generate_query_plan again", result["recommendation"])
         self.assertFalse(context.state["query_plan_completed"])
         self.assertNotIn("query_plan", context.state)
+
+    def test_repeated_plan_diagnosis_routes_upstream_instead_of_looping(self):
+        context = SimpleNamespace(state=valid_state())
+        invalid = {
+            "operation": "SELECT", "source_tables": ["unknown"],
+            "output_columns": ["unknown.id"], "steps": ["read source"],
+        }
+        first = json.loads(generate_and_validate_query_plan("Query", invalid, context))
+        second = json.loads(generate_and_validate_query_plan("Query", invalid, context))
+        self.assertTrue(first["retryable"])
+        self.assertFalse(second["retryable"])
+        self.assertEqual(second["return_to_phase"], "preprocessing")
+        self.assertEqual(second["next"], "return_to_upstream_phase")
 
     def test_regenerated_plan_creates_new_version(self):
         context = SimpleNamespace(state=valid_state())

@@ -88,7 +88,12 @@ def _preprocessing_refs(call: dict) -> tuple[set[str], set[str], set[str]]:
         if not isinstance(group, dict):
             continue
         table = str(group.get("table", "")).lower()
-        for value in group.get("columns", []) or []:
+        # The preprocessing tool accepts both grouped and normalized-flat
+        # column artifacts. Evaluation must recognize both representations.
+        values = group.get("columns")
+        if values is None and group.get("column", group.get("name")):
+            values = [group.get("column", group.get("name"))]
+        for value in values or []:
             name = value.get("name") if isinstance(value, dict) else value
             if table and name:
                 columns.add(f"{table}.{str(name).lower()}")
@@ -186,4 +191,3 @@ def calculate_hallucination_metrics(
         "explicit_unsupported_reference_detected": bool(explicit_events),
         "explicit_unsupported_reference_events": explicit_events,
     }
-

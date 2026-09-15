@@ -428,6 +428,18 @@ def authorize_tool_call(state: dict, tool_name: str, args: dict) -> dict | None:
                 return _block(
                     state, "preprocessing_not_finalized", "finalize_preprocessing_context",
                 )
+            upstream_required = state.get("_harness_plan_upstream_required") or {}
+            if (
+                upstream_required
+                and upstream_required.get("preprocessing_revision")
+                == int(state.get("_harness_preprocessing_revision", 0) or 0)
+            ):
+                return _block(
+                    state, "new_preprocessing_evidence_required",
+                    upstream_required.get(
+                        "required_action", "revise_and_finalize_preprocessing_context",
+                    ),
+                )
         elif tool_name == "validate_sql_to_plan":
             if not state.get("query_plan_validated", False):
                 return _block(state, "validated_plan_required", "generate_and_validate_query_plan")
@@ -601,6 +613,21 @@ def observe_tool_call(
         )
         # A new plan invalidates the SQL handoff even if the previous draft was valid.
         state["_harness_sql_contract_valid"] = False
+        if success is True:
+            state["_harness_plan_upstream_required"] = None
+        elif (
+            isinstance(parsed_response, dict)
+            and parsed_response.get("retryable") is False
+            and parsed_response.get("return_to_phase") == "preprocessing"
+        ):
+            state["_harness_plan_upstream_required"] = {
+                "preprocessing_revision": int(
+                    state.get("_harness_preprocessing_revision", 0) or 0
+                ),
+                "required_action": parsed_response.get(
+                    "required_action", "revise_and_finalize_preprocessing_context",
+                ),
+            }
     if not blocked and adapter == "improved" and event == "sql_validation":
         state["_harness_sql_contract_valid"] = success is True
     if not blocked and event == "sql_execution":

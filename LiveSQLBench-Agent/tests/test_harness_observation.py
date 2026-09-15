@@ -6,6 +6,29 @@ from system_agent.harness import (
 
 
 class HarnessObservationTests(unittest.TestCase):
+    def test_variant_three_requires_new_preprocessing_after_repeated_evidence_failure(self):
+        state = {
+            "active_harness_profile": "improved",
+            "active_agent_profile": "improved",
+            "preprocessing_completed": True,
+            "_harness_preprocessing_revision": 1,
+        }
+        response = {
+            "valid": False,
+            "retryable": False,
+            "return_to_phase": "preprocessing",
+            "required_action": "inspect_the_relevant_column",
+        }
+        observe_tool_call(
+            state, "generate_and_validate_query_plan",
+            {"category": "Query", "plan": {"operation": "SELECT"}}, response,
+        )
+        blocked = authorize_tool_call(
+            state, "generate_and_validate_query_plan",
+            {"category": "Query", "plan": {"operation": "SELECT", "revision": 2}},
+        )
+        self.assertEqual(blocked["reason"], "new_preprocessing_evidence_required")
+
     def test_variant_three_blocks_explicitly_invalid_semantic_contract(self):
         state = {
             "active_harness_profile": "improved",
