@@ -99,6 +99,7 @@ def _new_metrics(adapter: str) -> dict:
         "execution_diagnoses_completed": 0,
         "semantic_reviews_required": 0,
         "semantic_reviews_completed": 0,
+        "contract_blocks": 0,
         "empty_result_advisories": 0,
         "management_no_progress_advisories": 0,
         "budget_warnings": 0,
@@ -263,6 +264,10 @@ def _block(state: dict, reason: str, required_action: str) -> dict:
         metrics["no_progress_calls_blocked"] += 1
     elif reason == "event_budget_exhausted":
         metrics["budget_blocks"] += 1
+    elif reason in {
+        "semantic_plan_contract_required", "latest_sql_contract_required",
+    }:
+        metrics["contract_blocks"] += 1
     return {
         "allowed": False,
         "harness_blocked": True,
@@ -426,6 +431,11 @@ def authorize_tool_call(state: dict, tool_name: str, args: dict) -> dict | None:
         elif tool_name == "validate_sql_to_plan":
             if not state.get("query_plan_validated", False):
                 return _block(state, "validated_plan_required", "generate_and_validate_query_plan")
+            if state.get("_harness_plan_contract_valid") is False:
+                return _block(
+                    state, "semantic_plan_contract_required",
+                    "revise_the_plan_to_satisfy_every_semantic_contract_check",
+                )
             failed_sql = state.get("_harness_execution_diagnosis_required")
             if failed_sql:
                 if state.get("_harness_diagnosed_failed_sql_hash") != failed_sql:
@@ -480,6 +490,16 @@ def authorize_tool_call(state: dict, tool_name: str, args: dict) -> dict | None:
         elif tool_name == "submit_validated_sql":
             if not state.get("sql_generation_completed", False) or not state.get("draft_sql"):
                 return _block(state, "validated_sql_required", "validate_sql_to_plan")
+            if state.get("_harness_plan_contract_valid") is False:
+                return _block(
+                    state, "semantic_plan_contract_required",
+                    "generate_a_plan_with_a_valid_semantic_contract",
+                )
+            if state.get("_harness_sql_contract_valid") is False:
+                return _block(
+                    state, "latest_sql_contract_required",
+                    "validate_the_current_sql_against_the_current_plan",
+                )
             category = str((state.get("query_plan") or {}).get("category", "Query"))
             if category == "Query" and state.get("_harness_execution_diagnosis_required"):
                 return _block(
@@ -574,6 +594,15 @@ def observe_tool_call(
 
     if not blocked and event == "schema_read" and not error:
         state["_harness_schema_grounded"] = True
+    if not blocked and adapter == "improved" and event == "plan_attempt":
+        semantic = parsed_response.get("semantic_contract", {}) if isinstance(parsed_response, dict) else {}
+        state["_harness_plan_contract_valid"] = bool(
+            success is True and semantic.get("semantic_valid", True) is True
+        )
+        # A new plan invalidates the SQL handoff even if the previous draft was valid.
+        state["_harness_sql_contract_valid"] = False
+    if not blocked and adapter == "improved" and event == "sql_validation":
+        state["_harness_sql_contract_valid"] = success is True
     if not blocked and event == "sql_execution":
         sql = args.get("sql") if adapter == "baseline" else state.get("draft_sql")
         sql_hash = _sql_fingerprint(sql)

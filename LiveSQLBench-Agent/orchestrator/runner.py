@@ -58,6 +58,8 @@ async def run_parallel_evaluation(
         "max_no_progress_streak": 0,
         "event_counts": {},
     }
+    hallucination_totals: dict[str, dict[str, dict[str, int]]] = {}
+    explicit_hallucination_tasks = 0
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
 
     async def _save():
@@ -86,6 +88,25 @@ async def run_parallel_evaluation(
                     {"harness_observation": harness_totals}
                     if harness_totals["tasks_observed"] else {}
                 ),
+                "hallucination": {
+                    "definition": "false_positive_references_divided_by_all_references",
+                    "interpretation": "reference_divergence_proxy_not_database_nonexistence",
+                    "explicit_unsupported_task_count": explicit_hallucination_tasks,
+                    "explicit_unsupported_task_rate": explicit_hallucination_tasks / n,
+                    "phases": {
+                        phase: {
+                            kind: {
+                                **counts,
+                                "hallucination_rate": (
+                                    counts["hallucinated_count"] / counts["referenced_count"]
+                                    if counts["referenced_count"] else 0.0
+                                ),
+                            }
+                            for kind, counts in kinds.items()
+                        }
+                        for phase, kinds in hallucination_totals.items()
+                    },
+                },
             },
             "results": results,
         }
@@ -93,7 +114,7 @@ async def run_parallel_evaluation(
             json.dump(output, f, indent=2, default=str)
 
     async def _run_one(i: int, td: dict):
-        nonlocal total_reward, p1_count, completed
+        nonlocal total_reward, p1_count, completed, explicit_hallucination_tasks
         instance_id = td["instance_id"]
         async with semaphore:
             logger.info("=== Task %d/%d: %s ===", i + 1, len(tasks), instance_id)
@@ -142,6 +163,23 @@ async def run_parallel_evaluation(
                         harness_totals["budget_warning_events"].get(event, 0)
                         + int(count or 0)
                     )
+            hallucination = r.get("hallucination_metrics")
+            if isinstance(hallucination, dict):
+                explicit_hallucination_tasks += int(
+                    bool(hallucination.get("explicit_unsupported_reference_detected"))
+                )
+                for phase, phase_metrics in hallucination.get("phases", {}).items():
+                    phase_total = hallucination_totals.setdefault(phase, {})
+                    for kind, values in phase_metrics.items():
+                        if not isinstance(values, dict):
+                            continue
+                        counts = phase_total.setdefault(kind, {
+                            "referenced_count": 0,
+                            "supported_count": 0,
+                            "hallucinated_count": 0,
+                        })
+                        for key in counts:
+                            counts[key] += int(values.get(key, 0) or 0)
             completed += 1
             if completed % 5 == 0 or completed == len(tasks):
                 await _save()

@@ -133,6 +133,11 @@ async def run_single_task(
             "final_response": run_result.get("response", ""),
             "experiment": variant.as_dict(),
         }
+        # Evaluation-only diagnostics. This does not affect agent or harness state.
+        from orchestrator.hallucination_metrics import calculate_hallucination_metrics
+        result["hallucination_metrics"] = calculate_hallucination_metrics(
+            task_data, result["tool_trajectory"]
+        )
         if isinstance(state.get("harness_metrics"), dict):
             result["harness_metrics"] = state["harness_metrics"]
         logger.info(

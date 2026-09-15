@@ -6,6 +6,20 @@ from system_agent.harness import (
 
 
 class HarnessObservationTests(unittest.TestCase):
+    def test_variant_three_blocks_explicitly_invalid_semantic_contract(self):
+        state = {
+            "active_harness_profile": "improved",
+            "active_agent_profile": "improved",
+            "steps_remaining": 30,
+            "preprocessing_completed": True,
+            "query_plan_validated": True,
+            "_harness_plan_contract_valid": False,
+        }
+        blocked = authorize_tool_call(
+            state, "validate_sql_to_plan", {"sql": "SELECT 1", "plan_version": 1},
+        )
+        self.assertEqual(blocked["reason"], "semantic_plan_contract_required")
+
     class AdkLikeState:
         """Minimal ADK State interface: deliberately does not implement pop."""
 

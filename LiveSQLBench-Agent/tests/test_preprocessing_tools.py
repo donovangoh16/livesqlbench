@@ -79,6 +79,60 @@ class CompactSchemaToolTests(unittest.TestCase):
 
 
 class FinalizePreprocessingContextTests(unittest.TestCase):
+    @patch("system_agent.tools._knowledge_names", return_value=[])
+    @patch("system_agent.tools._post_json", return_value={"schema": ""})
+    @patch("system_agent.tools._column_metadata")
+    def test_inspection_backed_non_fk_relationship_is_allowed(
+        self, metadata, _post_json, _knowledge_names,
+    ):
+        metadata.return_value = {
+            "db|events|entity_id": "Entity identifier",
+            "db|entities|id": "Entity identifier",
+        }
+        context = SimpleNamespace(state={
+            "database_inspections": {
+                "events.entity_id": [1, 2], "entities.id": [1, 2],
+            }
+        })
+        result = json.loads(finalize_preprocessing_context(
+            selected_tables=["events", "entities"],
+            selected_columns=[
+                {"table": "events", "column": "entity_id", "role": "join"},
+                {"table": "entities", "column": "id", "role": "join"},
+            ],
+            selected_join_edges=[{
+                "left": "events.entity_id", "right": "entities.id",
+                "relationship_type": "evidence_supported",
+                "evidence": {"method": "value_overlap", "detail": "inspected IDs overlap"},
+            }],
+            required_knowledge_phrases=[], selected_knowledge=[],
+            unresolved_items=[], tool_context=context,
+        ))
+        self.assertTrue(result["valid"], result.get("errors"))
+        edge = context.state["preprocessing_context"]["selected_join_edges"][0]
+        self.assertEqual(edge["relationship_type"], "evidence_supported")
+
+    @patch("system_agent.tools._knowledge_names", return_value=[])
+    @patch("system_agent.tools._post_json", return_value={"schema": ""})
+    @patch("system_agent.tools._column_metadata")
+    def test_non_kb_instruction_does_not_create_false_completeness_error(
+        self, metadata, _post_json, _knowledge_names,
+    ):
+        metadata.return_value = {"db|events|id": "Identifier"}
+        context = SimpleNamespace(state={
+            "prepared_knowledge_context": {"required_phrases": []},
+        })
+        result = json.loads(finalize_preprocessing_context(
+            selected_tables=["events"],
+            selected_columns=[{"table": "events", "column": "id", "role": "output"}],
+            selected_join_edges=[], required_knowledge_phrases=["critical"],
+            selected_knowledge=[], unresolved_items=[], tool_context=context,
+        ))
+        self.assertTrue(result["valid"], result.get("errors"))
+        self.assertEqual(
+            context.state["preprocessing_context"]["non_kb_phrases"], ["critical"]
+        )
+
     @patch("system_agent.tools._knowledge_names", return_value=["Vendor Network Centrality"])
     @patch("system_agent.tools._post_json")
     @patch("system_agent.tools._column_metadata")

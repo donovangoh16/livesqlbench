@@ -1231,6 +1231,10 @@ def finalize_preprocessing_context(
                 }))
 
         normalized_edges = []
+        inspection_evidence = {
+            str(column).lower(): values
+            for column, values in tool_context.state.get("database_inspections", {}).items()
+        }
         for edge in selected_join_edges:
             left = str(edge.get("left", "")).strip().lower()
             right = str(edge.get("right", "")).strip().lower()
@@ -1243,12 +1247,35 @@ def finalize_preprocessing_context(
                 continue
             if left not in available_columns or right not in available_columns:
                 errors.append(f"Join edge references an unknown column: {left} = {right}")
-            if frozenset({left, right}) not in schema_edges:
-                errors.append(f"Join edge is not a declared foreign-key relationship: {left} = {right}")
+            declared_fk = frozenset({left, right}) in schema_edges
+            relationship_type = str(
+                edge.get("relationship_type", "declared_fk" if declared_fk else "")
+            ).strip().lower()
+            evidence = edge.get("evidence") if isinstance(edge.get("evidence"), dict) else {}
+            evidence_method = str(evidence.get("method", "")).strip().lower()
+            evidence_detail = str(evidence.get("detail", "")).strip()
+            supported_methods = {"value_overlap", "unique_key_match", "temporal_alignment"}
+            inspected_endpoints = left in inspection_evidence and right in inspection_evidence
+            if not declared_fk and not (
+                relationship_type == "evidence_supported"
+                and evidence_method in supported_methods
+                and evidence_detail
+                and inspected_endpoints
+            ):
+                errors.append(
+                    "Join edge is neither a declared foreign-key relationship nor "
+                    f"inspection-backed evidence_supported relationship: {left} = {right}"
+                )
             edge_tables = {endpoint.split(".", 1)[0] for endpoint in (left, right)}
             if not edge_tables.issubset(set(normalized_tables)):
                 errors.append(f"Join edge uses an unselected table: {left} = {right}")
-            normalized_edges.append({"left": left, "right": right})
+            normalized_edge = {"left": left, "right": right}
+            if not declared_fk:
+                normalized_edge["relationship_type"] = "evidence_supported"
+                normalized_edge["evidence"] = {
+                    "method": evidence_method, "detail": evidence_detail,
+                }
+            normalized_edges.append(normalized_edge)
 
         normalized_knowledge = []
         selected_names = []
@@ -1267,7 +1294,18 @@ def finalize_preprocessing_context(
             str(phrase).strip() for phrase in required_knowledge_phrases
             if str(phrase).strip()
         ))
-        for phrase in normalized_phrases:
+        prepared_knowledge = tool_context.state.get("prepared_knowledge_context")
+        prepared_required = {
+            str(phrase).strip().lower()
+            for phrase in (prepared_knowledge or {}).get("required_phrases", [])
+            if str(phrase).strip()
+        } if isinstance(prepared_knowledge, dict) else None
+        kb_phrases = [
+            phrase for phrase in normalized_phrases
+            if prepared_required is None or phrase.lower() in prepared_required
+        ]
+        non_kb_phrases = [phrase for phrase in normalized_phrases if phrase not in kb_phrases]
+        for phrase in kb_phrases:
             if not any(_similarity(phrase, name) >= 0.55 for name in selected_names):
                 errors.append(f"Required knowledge phrase is not covered: {phrase}")
 
@@ -1285,7 +1323,8 @@ def finalize_preprocessing_context(
             "selected_tables": normalized_tables,
             "selected_columns": normalized_columns,
             "selected_join_edges": normalized_edges,
-            "required_knowledge_phrases": normalized_phrases,
+            "required_knowledge_phrases": kb_phrases,
+            "non_kb_phrases": non_kb_phrases,
             "selected_knowledge": normalized_knowledge,
             "unresolved_items": normalized_unresolved,
         }
@@ -1590,6 +1629,10 @@ def _normalize_plan(plan: dict, category: str) -> tuple[dict, list[str]]:
             outputs.append({
                 "name": expression.split(".")[-1],
                 "expression": expression,
+                "source_expression": expression,
+                "result_grain": normalized.get("result_grain", ""),
+                "row_scope": "global_population",
+                "null_behavior": "preserve",
                 "expose": True,
             })
             continue
@@ -1599,6 +1642,11 @@ def _normalize_plan(plan: dict, category: str) -> tuple[dict, list[str]]:
         if "knowledge_id" not in item and item.get("knowledge_ids"):
             item["knowledge_id"] = item["knowledge_ids"][0]
         item.setdefault("expose", True)
+        if "source_expression" not in item and item.get("expression"):
+            item["source_expression"] = item["expression"]
+        item.setdefault("result_grain", normalized.get("result_grain", ""))
+        item.setdefault("row_scope", "output_only" if item.get("filter") else "global_population")
+        item.setdefault("null_behavior", "preserve")
         scale = str(item.get("scale", ""))
         if "rounding" in item:
             normalized_rounding = _rounding_places(item["rounding"])
@@ -1619,6 +1667,8 @@ def _normalize_plan(plan: dict, category: str) -> tuple[dict, list[str]]:
             moved_output_filters.append({
                 "expression": item.pop("filter"), "stage": "WHERE",
                 "phrase": f"restriction for {item.get('name', 'output')}",
+                "row_scope": "output_only",
+                "applies_to_outputs": [str(item.get("name", "output"))],
             })
         outputs.append(item)
     normalized["output_columns"] = outputs
@@ -1662,13 +1712,32 @@ def _normalize_plan(plan: dict, category: str) -> tuple[dict, list[str]]:
                         str(item.get("expression", "")), re.I,
                     ) else "WHERE"
                 )
+            if field in {"conditions", "affected_row_conditions"}:
+                item.setdefault(
+                    "row_scope",
+                    "management_affected_rows" if category == "Management"
+                    else "global_population",
+                )
+                item.setdefault("applies_to_outputs", [])
             items.append(item)
         normalized[field] = items
+
+    population_items = []
+    for value in normalized.get("population_constraints") or []:
+        item = dict(value) if isinstance(value, dict) else {
+            "phrase": "global restriction", "predicate": str(value),
+        }
+        item.setdefault("row_scope", "global_population")
+        item.setdefault("applies_to_outputs", [])
+        population_items.append(item)
+    normalized["population_constraints"] = population_items
 
     if moved_output_filters:
         normalized.setdefault("conditions", []).extend(moved_output_filters)
         normalized.setdefault("population_constraints", []).extend({
-            "phrase": item["phrase"], "predicate": item["expression"]
+            "phrase": item["phrase"], "predicate": item["expression"],
+            "row_scope": item["row_scope"],
+            "applies_to_outputs": item["applies_to_outputs"],
         } for item in moved_output_filters)
         changes.append("non-aggregate output filters moved to WHERE")
 
@@ -1775,6 +1844,17 @@ def _compact_plan_contract(plan: dict) -> dict:
     ))
     return {
         "output_count": len(plan.get("output_columns") or []),
+        "output_bindings": [
+            {
+                "name": item.get("name"),
+                "source_expression": item.get("source_expression", item.get("expression")),
+                "result_grain": item.get("result_grain", plan.get("result_grain")),
+                "row_scope": item.get("row_scope"),
+                "applies_to_outputs": item.get("applies_to_outputs", []),
+                "knowledge_id": item.get("knowledge_id", item.get("kb_id")),
+            }
+            for item in (plan.get("output_columns") or []) if isinstance(item, dict)
+        ],
         "knowledge_ids": knowledge_ids,
         "formula_dependencies": dependencies,
         "population": [
@@ -2207,7 +2287,22 @@ def validate_query_plan(tool_context: ToolContext) -> str:
             )
 
     for output in plan.get("output_columns", []) or []:
-        if not isinstance(output, dict) or not output.get("filter"):
+        if not isinstance(output, dict):
+            continue
+        if category == "Query" and output.get("expose", True):
+            if not output.get("name"):
+                errors.append(f"Exposed output requires a name: {output}")
+            if not output.get("source_expression", output.get("expression")):
+                errors.append(f"Exposed output requires source_expression: {output.get('name', output)}")
+            if not output.get("result_grain", plan.get("result_grain")):
+                errors.append(f"Exposed output requires result_grain: {output.get('name', output)}")
+            if output.get("row_scope") not in {
+                "global_population", "output_only", "aggregation_only",
+            }:
+                errors.append(
+                    f"Exposed output has invalid row_scope: {output.get('name', output)}"
+                )
+        if not output.get("filter"):
             continue
         expression = str(output.get("expression", ""))
         aggregate = str(output.get("aggregate", ""))
@@ -2216,6 +2311,27 @@ def validate_query_plan(tool_context: ToolContext) -> str:
             expression, re.I,
         ):
             errors.append(f"Output filter requires an aggregate output: {output.get('name', output)}")
+
+    output_names = {
+        str(output.get("name")) for output in (plan.get("output_columns") or [])
+        if isinstance(output, dict) and output.get("name")
+    }
+    for constraint in plan_constraints:
+        if not isinstance(constraint, dict):
+            continue
+        scope = constraint.get("row_scope")
+        allowed_scopes = (
+            {"management_affected_rows"} if category == "Management"
+            else {"global_population", "output_only", "aggregation_only"}
+        )
+        if scope not in allowed_scopes:
+            errors.append(f"Restriction has invalid row_scope: {constraint}")
+        applies_to = constraint.get("applies_to_outputs") or []
+        unknown_outputs = sorted(set(map(str, applies_to)) - output_names)
+        if unknown_outputs:
+            errors.append(f"Restriction applies_to_outputs are unknown: {unknown_outputs}")
+        if scope != "global_population" and category == "Query" and not applies_to:
+            errors.append(f"Scoped restriction requires applies_to_outputs: {constraint}")
 
     referenced_columns = []
     for field in ("output_columns", "target_objects"):
@@ -3053,6 +3169,21 @@ def execute_validated_sql(tool_context: ToolContext) -> str:
     summary["has_rows"] = not summary.get("empty", False)
     alerts = []
     plan = (tool_context.state.get("query_plan") or {}).get("plan", {})
+    expected_outputs = [
+        output for output in (plan.get("output_columns") or [])
+        if not isinstance(output, dict) or output.get("expose", True)
+    ]
+    observed_columns = summary.get("columns") or []
+    has_wildcard_output = any(
+        str(output.get("expression", output.get("name", "")) if isinstance(output, dict) else output).strip() == "*"
+        for output in expected_outputs
+    )
+    if expected_outputs and observed_columns and not has_wildcard_output and len(observed_columns) != len(expected_outputs):
+        alerts.append({
+            "code": "OUTPUT_COUNT_MISMATCH",
+            "expected": len(expected_outputs),
+            "observed": len(observed_columns),
+        })
     ranges = summary.get("numeric_ranges", {})
     for output in plan.get("output_columns", []) or []:
         if not isinstance(output, dict) or not output.get("expected_range"):
