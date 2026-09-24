@@ -18,6 +18,8 @@ from system_agent.adk_runtime import AdkRuntime
 logger = logging.getLogger(__name__)
 app = FastAPI(title="LiveSQLBench System Agent", version="1.0.0")
 runtime = AdkRuntime()
+from multi_agent.coordinator import MultiAgentCoordinator
+multi_agent_coordinator = MultiAgentCoordinator(runtime)
 
 
 class SessionInitRequest(BaseModel):
@@ -35,6 +37,10 @@ class SessionRunRequest(BaseModel):
 async def init_session(req: SessionInitRequest):
     if not runtime.available:
         raise HTTPException(status_code=503, detail=f"ADK runtime unavailable: {runtime.error}")
+    if req.state.get("active_orchestration_profile") == "multi":
+        return await multi_agent_coordinator.init_task(
+            task_id=req.task_id, state=req.state, reset=req.reset,
+        )
     return await runtime.init_session(
         task_id=req.task_id,
         state=req.state,
@@ -46,6 +52,10 @@ async def init_session(req: SessionInitRequest):
 async def run_session(req: SessionRunRequest):
     if not runtime.available:
         raise HTTPException(status_code=503, detail=f"ADK runtime unavailable: {runtime.error}")
+    if multi_agent_coordinator.has_task(req.task_id):
+        return await multi_agent_coordinator.run(
+            task_id=req.task_id, initial_message=req.message,
+        )
     return await runtime.run_turn(
         task_id=req.task_id,
         message=req.message,

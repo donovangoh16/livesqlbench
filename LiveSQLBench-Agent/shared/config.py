@@ -52,8 +52,7 @@ class Settings(BaseSettings):
     # Budget / turns
     patience: int = 3
 
-    # Experiment variant (0-3). Variants 1 and 3 currently activate the
-    # improved four-phase agent prompt; harness behavior remains baseline.
+    # Experiment variant (0-5). Variants 4 and 5 use multi-agent orchestration.
     experiment_variant: int = 0
 
     @property

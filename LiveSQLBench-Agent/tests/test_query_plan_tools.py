@@ -42,6 +42,63 @@ def valid_state():
 
 
 class QueryPlanToolTests(unittest.TestCase):
+    def test_plan_rejects_distorted_kb_formula_and_records_diagnostics(self):
+        state = valid_state()
+        state["preprocessing_context"]["selected_knowledge"] = [
+            {"id": 7, "name": "Vendor Score"},
+        ]
+        state["prepared_knowledge_context"] = {
+            "required_knowledge_ids": [7],
+            "knowledge": [{
+                "id": 7,
+                "name": "Vendor Score",
+                "definition": r"VS = \frac{vendregistry}{1000} \times (1 - \frac{mktref}{10}) \times 10",
+                "depends_on": [],
+            }],
+        }
+        context = SimpleNamespace(state=state)
+        result = json.loads(generate_and_validate_query_plan("Query", {
+            "operation": "SELECT", "result_grain": "one row per vendor",
+            "source_tables": ["vendors"], "joins": [],
+            "output_columns": [{
+                "name": "vendor_score",
+                "expression": "vendors.vendregistry / NULLIF(vendors.mktref, 0)",
+                "knowledge_id": 7,
+            }],
+        }, context))
+        self.assertFalse(result["valid"])
+        self.assertTrue(any("formula is not preserved" in error for error in result["errors"]))
+        diagnostic = context.state["kb_formula_preservation"]
+        self.assertFalse(diagnostic["all_preserved"])
+        self.assertIn("1000", diagnostic["checks"][0]["missing_constants"])
+
+    def test_plan_accepts_literal_kb_formula_signature(self):
+        state = valid_state()
+        state["preprocessing_context"]["selected_knowledge"] = [
+            {"id": 7, "name": "Vendor Score"},
+        ]
+        state["prepared_knowledge_context"] = {
+            "required_knowledge_ids": [7],
+            "knowledge": [{
+                "id": 7,
+                "name": "Vendor Score",
+                "definition": r"VS = \frac{vendregistry}{1000} \times (1 - \frac{mktref}{10}) \times 10",
+                "depends_on": [],
+            }],
+        }
+        context = SimpleNamespace(state=state)
+        result = json.loads(generate_and_validate_query_plan("Query", {
+            "operation": "SELECT", "result_grain": "one row per vendor",
+            "source_tables": ["vendors"], "joins": [],
+            "output_columns": [{
+                "name": "vendor_score",
+                "expression": "vendors.vendregistry / 1000.0 * (1 - vendors.mktref / 10.0) * 10",
+                "knowledge_id": 7,
+            }],
+        }, context))
+        self.assertTrue(result["valid"], result.get("errors"))
+        self.assertTrue(result["kb_formula_preservation"]["all_preserved"])
+
     def test_json_paths_are_not_categorical_literals(self):
         predicate = (
             "payload->>'status' = 'Active' AND "

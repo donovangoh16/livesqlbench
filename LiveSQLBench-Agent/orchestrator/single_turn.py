@@ -57,8 +57,10 @@ async def init_agent_session(task_id: str, task_data: dict, variant: VariantConf
         "experiment_variant": variant.number,
         "requested_agent_profile": variant.requested_agent_profile,
         "requested_harness_profile": variant.requested_harness_profile,
+        "requested_orchestration_profile": variant.requested_orchestration_profile,
         "active_agent_profile": variant.active_agent_profile,
         "active_harness_profile": variant.active_harness_profile,
+        "active_orchestration_profile": variant.active_orchestration_profile,
     }
     return await _post(
         f"{SYSTEM_AGENT_URL}/init_session",
@@ -133,6 +135,21 @@ async def run_single_task(
             "final_response": run_result.get("response", ""),
             "experiment": variant.as_dict(),
         }
+        if variant.active_orchestration_profile == "multi":
+            result["multi_agent_metrics"] = {
+                "phase_agent_sequence": state.get("phase_agent_sequence", []),
+                "phase_transitions": state.get("phase_transitions", []),
+                "backward_transitions": int(state.get("backward_transitions", 0) or 0),
+                "phase_retries": int(state.get("phase_retries", 0) or 0),
+                "routing_events": state.get("routing_events", []),
+                "phase_completion": state.get("phase_completion", {}),
+                "agent_metrics": state.get("agent_metrics", {}),
+                "multi_agent_stop_reason": state.get("multi_agent_stop_reason"),
+                "submission_attempted": bool(state.get("submission_attempted")),
+                "kb_formula_preservation": state.get("kb_formula_preservation", {}),
+            }
+        if isinstance(state.get("kb_formula_preservation"), dict):
+            result["kb_formula_preservation"] = state["kb_formula_preservation"]
         # Evaluation-only diagnostics. This does not affect agent or harness state.
         from orchestrator.hallucination_metrics import calculate_hallucination_metrics
         result["hallucination_metrics"] = calculate_hallucination_metrics(

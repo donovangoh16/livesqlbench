@@ -1,7 +1,10 @@
-"""Single source of truth for the four SQL-agent experiment variants.
+"""Single source of truth for the SQL-agent experiment variants.
 
 Agent prompt improvements are active for variants 1 and 3. Observation-only
 harness instrumentation is active for variants 2 and 3.
+
+Variants 4 and 5 use the forward-only four-agent coordinator. Variant 4 keeps
+the Variant 1 agent/harness profiles; Variant 5 keeps the Variant 3 profiles.
 """
 
 from dataclasses import asdict, dataclass
@@ -13,16 +16,27 @@ class VariantConfig:
     number: int
     requested_agent_profile: str
     requested_harness_profile: str
+    requested_orchestration_profile: str = "single"
     active_agent_profile: str = "baseline"
     active_harness_profile: str = "baseline"
+    active_orchestration_profile: str = "single"
 
     def as_dict(self) -> Dict[str, object]:
         return asdict(self)
 
     @property
     def behavior_signature(self) -> tuple[str, str]:
-        """Profiles that currently affect runtime behavior."""
+        """Backward-compatible agent/harness behavior signature."""
         return self.active_agent_profile, self.active_harness_profile
+
+    @property
+    def runtime_signature(self) -> tuple[str, str, str]:
+        """All profiles that currently affect runtime behavior."""
+        return (
+            self.active_agent_profile,
+            self.active_harness_profile,
+            self.active_orchestration_profile,
+        )
 
 
 VARIANTS = {
@@ -32,6 +46,16 @@ VARIANTS = {
     3: VariantConfig(
         3, "improved", "improved",
         active_agent_profile="improved", active_harness_profile="improved",
+    ),
+    4: VariantConfig(
+        4, "improved", "baseline", requested_orchestration_profile="multi",
+        active_agent_profile="improved", active_harness_profile="baseline",
+        active_orchestration_profile="multi",
+    ),
+    5: VariantConfig(
+        5, "improved", "improved", requested_orchestration_profile="multi",
+        active_agent_profile="improved", active_harness_profile="improved",
+        active_orchestration_profile="multi",
     ),
 }
 

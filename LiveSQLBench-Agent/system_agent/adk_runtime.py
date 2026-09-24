@@ -73,7 +73,12 @@ class AdkRuntime:
         if not self.available or self._backend is None:
             raise RuntimeError(self.error or "ADK runtime unavailable")
 
-        agent = self._backend["build_agent"](profile=agent_profile)
+        if agent_profile.startswith("multi_"):
+            phase = agent_profile.removeprefix("multi_")
+            from multi_agent.agents import build_phase_agent
+            agent = build_phase_agent(phase)
+        else:
+            agent = self._backend["build_agent"](profile=agent_profile)
         app_name = f"{self._app_name}_{agent_profile}"
 
         if self._backend["runner_kind"] == "in_memory":
@@ -248,7 +253,10 @@ class AdkRuntime:
     ) -> Dict[str, Any]:
         async with self._lock:
             session_state = state or {}
-            agent_profile = session_state.get("active_agent_profile", "baseline")
+            agent_profile = session_state.get(
+                "runtime_agent_profile",
+                session_state.get("active_agent_profile", "baseline"),
+            )
             runner = await self._get_runner(agent_profile)
             if task_id in self._session_refs and not reset:
                 ref = self._session_refs[task_id]

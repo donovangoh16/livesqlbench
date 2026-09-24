@@ -60,6 +60,20 @@ async def run_parallel_evaluation(
     }
     hallucination_totals: dict[str, dict[str, dict[str, int]]] = {}
     explicit_hallucination_tasks = 0
+    kb_formula_totals = {
+        "tasks_observed": 0,
+        "tasks_all_preserved": 0,
+        "checked_knowledge_count": 0,
+        "preserved_knowledge_count": 0,
+    }
+    multi_agent_totals = {
+        "tasks_observed": 0,
+        "backward_transitions": 0,
+        "phase_retries": 0,
+        "submission_attempts": 0,
+        "stop_reasons": {},
+        "agent_metrics": {},
+    }
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
 
     async def _save():
@@ -87,6 +101,25 @@ async def run_parallel_evaluation(
                 **(
                     {"harness_observation": harness_totals}
                     if harness_totals["tasks_observed"] else {}
+                ),
+                **(
+                    {"multi_agent_observation": multi_agent_totals}
+                    if multi_agent_totals["tasks_observed"] else {}
+                ),
+                **(
+                    {"kb_formula_preservation": {
+                        **kb_formula_totals,
+                        "task_preservation_rate": (
+                            kb_formula_totals["tasks_all_preserved"]
+                            / kb_formula_totals["tasks_observed"]
+                        ),
+                        "knowledge_preservation_rate": (
+                            kb_formula_totals["preserved_knowledge_count"]
+                            / kb_formula_totals["checked_knowledge_count"]
+                            if kb_formula_totals["checked_knowledge_count"] else None
+                        ),
+                    }}
+                    if kb_formula_totals["tasks_observed"] else {}
                 ),
                 "hallucination": {
                     "definition": "false_positive_references_divided_by_all_references",
@@ -180,6 +213,42 @@ async def run_parallel_evaluation(
                         })
                         for key in counts:
                             counts[key] += int(values.get(key, 0) or 0)
+            formula_metrics = r.get("kb_formula_preservation")
+            if (
+                isinstance(formula_metrics, dict)
+                and int(formula_metrics.get("checked_knowledge_count", 0) or 0) > 0
+            ):
+                kb_formula_totals["tasks_observed"] += 1
+                kb_formula_totals["tasks_all_preserved"] += int(
+                    bool(formula_metrics.get("all_preserved"))
+                )
+                kb_formula_totals["checked_knowledge_count"] += int(
+                    formula_metrics.get("checked_knowledge_count", 0) or 0
+                )
+                kb_formula_totals["preserved_knowledge_count"] += int(
+                    formula_metrics.get("preserved_knowledge_count", 0) or 0
+                )
+            multi = r.get("multi_agent_metrics")
+            if isinstance(multi, dict):
+                multi_agent_totals["tasks_observed"] += 1
+                multi_agent_totals["backward_transitions"] += int(
+                    multi.get("backward_transitions", 0) or 0
+                )
+                multi_agent_totals["phase_retries"] += int(
+                    multi.get("phase_retries", 0) or 0
+                )
+                multi_agent_totals["submission_attempts"] += int(
+                    bool(multi.get("submission_attempted"))
+                )
+                reason = multi.get("multi_agent_stop_reason")
+                if reason:
+                    stop_reasons = multi_agent_totals["stop_reasons"]
+                    stop_reasons[reason] = stop_reasons.get(reason, 0) + 1
+                for phase, values in (multi.get("agent_metrics") or {}).items():
+                    totals = multi_agent_totals["agent_metrics"].setdefault(phase, {})
+                    for key, value in values.items():
+                        if isinstance(value, (int, float)):
+                            totals[key] = totals.get(key, 0) + value
             completed += 1
             if completed % 5 == 0 or completed == len(tasks):
                 await _save()
@@ -274,9 +343,13 @@ def main():
         help="Run only tasks from this database; applied before --limit",
     )
     parser.add_argument(
-        "--variant", type=int, choices=range(4),
+        "--variant", type=int, choices=range(6),
         default=settings.experiment_variant,
-        help="Experiment variant: 0=baseline, 1=agent, 2=harness, 3=combined",
+        help=(
+            "Experiment variant: 0=baseline single, 1=agent single, "
+            "2=harness single, 3=combined single, 4=agent multi, "
+            "5=combined multi"
+        ),
     )
     args = parser.parse_args()
 
@@ -285,12 +358,14 @@ def main():
     variant = get_variant(args.variant)
     tasks = load_tasks(args.data, args.limit, args.category, args.database)
     logger.info(
-        "Single-turn variant %d: requested=(%s, %s), active=(%s, %s)",
+        "Variant %d: requested=(%s, %s, %s), active=(%s, %s, %s)",
         variant.number,
         variant.requested_agent_profile,
         variant.requested_harness_profile,
+        variant.requested_orchestration_profile,
         variant.active_agent_profile,
         variant.active_harness_profile,
+        variant.active_orchestration_profile,
     )
     logger.info("Evaluating %d tasks with concurrency=%d", len(tasks), args.concurrency)
 

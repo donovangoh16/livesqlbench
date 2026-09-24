@@ -209,6 +209,8 @@ def _categorical_literals(predicate: str) -> list[str]:
             lowered.startswith("$")
             or re.fullmatch(r"\{[^}]*\}", value.strip())
             or re.fullmatch(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+", value.strip())
+            or re.fullmatch(r"[-+]?\d+(?:\.\d+)?(?:\s*%|\s*[a-zA-Z]+)?", value.strip())
+            or "\\" in value
         ):
             continue
         literals.append(value)
@@ -1087,6 +1089,23 @@ def prepare_knowledge_context(
     tool_context: ToolContext,
 ) -> str:
     """Identify, rank, retrieve, and check relevant KB entries in one call."""
+    recovery = tool_context.state.get("multi_agent_recovery_directive") or {}
+    stored = tool_context.state.get("prepared_knowledge_context")
+    required_action = str(recovery.get("required_action", "")).lower()
+    if (
+        isinstance(stored, dict) and stored
+        and required_action
+        and not any(word in required_action for word in ("knowledge", "kb", "formula"))
+    ):
+        return json.dumps({
+            "status": "reused_stored_knowledge",
+            "knowledge_ids": [
+                item.get("id") for item in stored.get("knowledge", [])
+                if item.get("id") is not None
+            ],
+            "required_action": required_action,
+            "next": "acquire_only_the_named_missing_evidence_then_finalize",
+        }, separators=(",", ":"))
     requirements = json.loads(identify_knowledge_requirements(
         question, candidate_phrases, selected_columns, tool_context,
     ))
@@ -1512,6 +1531,27 @@ def _physical_table_and_alias(value) -> tuple[str, str]:
     return table, alias.strip('"').lower()
 
 
+def _unique_inferred_table_aliases(tables: list[str]) -> dict[str, str]:
+    """Infer only unambiguous conventional aliases from physical names."""
+    stopwords = {"and", "or", "of", "the", "to", "for", "in"}
+    candidates: dict[str, set[str]] = {}
+    for table in tables:
+        words = [
+            word for word in re.findall(r"[a-z0-9]+", str(table).lower())
+            if word not in stopwords
+        ]
+        aliases = set()
+        if len(words) > 1:
+            aliases.add("".join(word[0] for word in words))
+        for alias in aliases:
+            if len(alias) >= 2:
+                candidates.setdefault(alias, set()).add(str(table).lower())
+    return {
+        alias: next(iter(matches))
+        for alias, matches in candidates.items() if len(matches) == 1
+    }
+
+
 def _find_management_sql_text(value) -> str:
     """Find SQL-like text recursively without depending on payload field names."""
     candidates = []
@@ -1732,6 +1772,7 @@ def _normalize_plan(plan: dict, category: str) -> tuple[dict, list[str]]:
             aliases[table] = table
             if alias:
                 aliases[alias] = table
+    aliases.update(_unique_inferred_table_aliases(tables))
     normalized["source_tables"] = list(dict.fromkeys(tables))
     if raw_tables and normalized["source_tables"] != raw_tables:
         changes.append("source_tables normalized to physical names")
@@ -2082,6 +2123,116 @@ def _plan_knowledge_ids(plan: dict) -> set[str]:
     return found
 
 
+def _kb_formula_signature(definition: str) -> dict:
+    """Extract explicit formula features without judging prose semantics."""
+    from decimal import Decimal, InvalidOperation
+
+    def canonical_number(value: str) -> str:
+        try:
+            normalized_value = format(Decimal(value).normalize(), "f")
+            return "0" if normalized_value in {"-0", ""} else normalized_value
+        except InvalidOperation:
+            return value
+
+    text = re.split(r"\\text\s*\{", str(definition or ""), maxsplit=1)[0]
+    formula_like = bool(
+        re.search(r">=|<=|!=|<>|[><=]|\\(?:frac|times|cdot)\b", text)
+        or re.search(r"[A-Za-z0-9)]\s*[+*/]\s*[(A-Za-z0-9]", text)
+    )
+    if not formula_like:
+        return {"constants": [], "comparisons": [], "operators": []}
+    normalized = (
+        text.replace("≥", ">=").replace("≤", "<=").replace("≠", "!=")
+        .replace(r"\geq", ">=").replace(r"\ge", ">=")
+        .replace(r"\leq", "<=").replace(r"\le", "<=")
+        .replace(r"\times", "*").replace(r"\cdot", "*")
+    )
+    constants = sorted({
+        canonical_number(value) for value in re.findall(
+            r"(?<![A-Za-z_])-?\d+(?:\.\d+)?", normalized
+        )
+    })
+    comparisons = sorted(set(
+        f"{operator}{canonical_number(number)}"
+        for operator, number in re.findall(
+            r"(>=|<=|!=|<>|>|<)\s*(-?\d+(?:\.\d+)?)", normalized
+        )
+    ))
+    operators = sorted({
+        operator for operator, pattern in {
+            "multiply": r"\*", "divide": r"/|\\frac\s*\{",
+            "add": r"\+", "subtract": r"(?<![<>=!])-",
+        }.items() if re.search(pattern, normalized)
+    })
+    return {
+        "constants": constants,
+        "comparisons": comparisons,
+        "operators": operators,
+    }
+
+
+def _plan_kb_formula_preservation(plan: dict, tool_context: ToolContext) -> dict:
+    """Compare KB-backed plan expressions with retrieved formula facts."""
+    expressions_by_id: dict[str, list[str]] = {}
+
+    def visit(value):
+        if isinstance(value, dict):
+            knowledge_id = value.get("knowledge_id", value.get("kb_id"))
+            if knowledge_id is not None:
+                fragments = [
+                    str(value.get(key, "")) for key in (
+                        "expression", "source_expression", "predicate", "body", "definition",
+                        "formula_dependencies",
+                    ) if value.get(key)
+                ]
+                expressions_by_id.setdefault(str(knowledge_id), []).extend(fragments)
+            for nested in value.values():
+                visit(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                visit(nested)
+
+    visit(plan)
+    definitions = {
+        str(item.get("id")): str(item.get("definition", ""))
+        for item in tool_context.state.get("prepared_knowledge_context", {}).get(
+            "knowledge", []
+        )
+        if item.get("id") is not None
+    }
+    checks = []
+    for knowledge_id, fragments in expressions_by_id.items():
+        definition = definitions.get(knowledge_id, "")
+        expected = _kb_formula_signature(definition)
+        if not definition or not any(expected.values()):
+            continue
+        observed = _kb_formula_signature(" ".join(fragments))
+        missing_constants = sorted(set(expected["constants"]) - set(observed["constants"]))
+        missing_comparisons = sorted(
+            set(expected["comparisons"]) - set(observed["comparisons"])
+        )
+        missing_operators = sorted(set(expected["operators"]) - set(observed["operators"]))
+        checks.append({
+            "knowledge_id": knowledge_id,
+            "preserved": not (
+                missing_constants or missing_comparisons or missing_operators
+            ),
+            "expected": expected,
+            "missing_constants": missing_constants,
+            "missing_comparisons": missing_comparisons,
+            "missing_operators": missing_operators,
+        })
+    checked = len(checks)
+    preserved = sum(bool(item["preserved"]) for item in checks)
+    return {
+        "checked_knowledge_count": checked,
+        "preserved_knowledge_count": preserved,
+        "preservation_rate": preserved / checked if checked else None,
+        "all_preserved": all(item["preserved"] for item in checks),
+        "checks": checks,
+    }
+
+
 def _plan_recovery_phase(errors: list[str]) -> tuple[str, str]:
     """Route a rejected plan to the earliest phase capable of fixing it."""
     text = " ".join(map(str, errors)).lower()
@@ -2402,6 +2553,23 @@ def validate_query_plan(tool_context: ToolContext) -> str:
                 reject_unrequested_formula_transforms(item)
 
     reject_unrequested_formula_transforms(plan)
+
+    formula_preservation = _plan_kb_formula_preservation(plan, tool_context)
+    tool_context.state["kb_formula_preservation"] = formula_preservation
+    for check in formula_preservation["checks"]:
+        if check["preserved"]:
+            continue
+        missing = []
+        if check["missing_constants"]:
+            missing.append("constants " + ", ".join(check["missing_constants"]))
+        if check["missing_comparisons"]:
+            missing.append("thresholds " + ", ".join(check["missing_comparisons"]))
+        if check["missing_operators"]:
+            missing.append("operators " + ", ".join(check["missing_operators"]))
+        errors.append(
+            f"Knowledge ID {check['knowledge_id']} formula is not preserved; missing "
+            + "; ".join(missing)
+        )
 
     source_tables = [str(table).lower() for table in plan.get("source_tables", [])]
     if category == "Query" and not source_tables:
@@ -2758,6 +2926,7 @@ def validate_query_plan(tool_context: ToolContext) -> str:
         "warnings": warnings,
         "contract": _compact_plan_contract(plan),
         "semantic_contract": semantic_contract,
+        "kb_formula_preservation": formula_preservation,
         "generation_strategy": _generation_strategy(category, derived_difficulty),
         "next": "generate_sql",
     }
@@ -3140,7 +3309,7 @@ def validate_sql_to_plan(
             statements = plan.get("required_statements") or plan.get("statement_sequence") or []
             positions = []
             search_cursor = 0
-            for statement in statements:
+            for statement_index, statement in enumerate(statements):
                 if isinstance(statement, dict):
                     name = str(statement.get("name") or statement.get("target") or "").lower()
                     operation_name = str(statement.get("operation") or statement.get("type") or "").upper()
@@ -3169,9 +3338,14 @@ def validate_sql_to_plan(
                     target_position = sql_lower.find(name.split(".")[-1], position)
                     position = target_position if target_position >= 0 else -1
                 if position < 0:
+                    statement_number = statement_index + 1
+                    expected_target = name.split(".")[-1] if name else "unspecified target"
                     add_diagnosis(
-                        "missing_required_statement", f"Required statement is missing: {statement}",
-                        "required_statements", "Add every required Management statement.",
+                        "missing_required_statement",
+                        f"Required statement {statement_number} is missing: "
+                        f"operation={operation_name}, target={expected_target}.",
+                        f"required_statements[{statement_number - 1}]",
+                        "Add this exact missing operation at its planned dependency position.",
                     )
                 else:
                     positions.append(position)

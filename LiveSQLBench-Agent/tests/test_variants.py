@@ -12,30 +12,42 @@ class VariantConfigurationTests(unittest.TestCase):
             1: ("improved", "baseline"),
             2: ("baseline", "improved"),
             3: ("improved", "improved"),
+            4: ("improved", "baseline"),
+            5: ("improved", "improved"),
         }
         actual = {
             number: (
                 get_variant(number).requested_agent_profile,
                 get_variant(number).requested_harness_profile,
             )
-            for number in range(4)
+            for number in range(6)
         }
         self.assertEqual(actual, expected)
 
-    def test_prompt_change_is_only_active_for_variants_one_and_three(self):
+    def test_active_profiles_include_milestone_zero_aliases(self):
         active_profiles = {
-            number: get_variant(number).behavior_signature for number in range(4)
+            number: get_variant(number).behavior_signature for number in range(6)
         }
         self.assertEqual(active_profiles, {
             0: ("baseline", "baseline"),
             1: ("improved", "baseline"),
             2: ("baseline", "improved"),
             3: ("improved", "improved"),
+            4: ("improved", "baseline"),
+            5: ("improved", "improved"),
         })
+
+    def test_multi_agent_variants_are_active_after_forward_coordinator_milestone(self):
+        self.assertEqual(get_variant(4).requested_orchestration_profile, "multi")
+        self.assertEqual(get_variant(5).requested_orchestration_profile, "multi")
+        self.assertEqual(get_variant(4).active_orchestration_profile, "multi")
+        self.assertEqual(get_variant(5).active_orchestration_profile, "multi")
+        self.assertNotEqual(get_variant(4).runtime_signature, get_variant(1).runtime_signature)
+        self.assertNotEqual(get_variant(5).runtime_signature, get_variant(3).runtime_signature)
 
     def test_invalid_variant_is_rejected(self):
         with self.assertRaises(ValueError):
-            get_variant(4)
+            get_variant(6)
 
     def test_variants_resolve_to_the_expected_prompt(self):
         expected = {
@@ -43,6 +55,8 @@ class VariantConfigurationTests(unittest.TestCase):
             1: IMPROVED_INSTRUCTION,
             2: BASELINE_INSTRUCTION,
             3: IMPROVED_INSTRUCTION,
+            4: IMPROVED_INSTRUCTION,
+            5: IMPROVED_INSTRUCTION,
         }
         for number, instruction in expected.items():
             profile = get_variant(number).active_agent_profile
@@ -98,7 +112,7 @@ class VariantConfigurationTests(unittest.TestCase):
             self.assertIn(marker, IMPROVED_INSTRUCTION)
             self.assertNotIn(marker, BASELINE_INSTRUCTION)
 
-    def test_improved_tools_are_only_used_by_variants_one_and_three(self):
+    def test_improved_tools_are_used_by_improved_agent_variants(self):
         baseline_names = tuple(tool.name for tool in get_tools("baseline"))
         improved_names = tuple(tool.name for tool in get_tools("improved"))
         self.assertEqual(len(baseline_names), 8)
@@ -118,7 +132,7 @@ class VariantConfigurationTests(unittest.TestCase):
                 tuple(tool.name for tool in get_tools(get_variant(number).active_agent_profile)),
                 baseline_names,
             )
-        for number in (1, 3):
+        for number in (1, 3, 4, 5):
             self.assertEqual(
                 tuple(tool.name for tool in get_tools(get_variant(number).active_agent_profile)),
                 improved_names,
