@@ -150,13 +150,12 @@ async def run_single_task(
             }
         if isinstance(state.get("kb_formula_preservation"), dict):
             result["kb_formula_preservation"] = state["kb_formula_preservation"]
-        # Evaluation-only diagnostics. This does not affect agent or harness state.
-        from orchestrator.hallucination_metrics import calculate_hallucination_metrics
-        result["hallucination_metrics"] = calculate_hallucination_metrics(
-            task_data, result["tool_trajectory"]
-        )
         if isinstance(state.get("harness_metrics"), dict):
             result["harness_metrics"] = state["harness_metrics"]
+        from orchestrator.evaluation_metrics import calculate_task_evaluation_metrics
+        result["evaluation_metrics"] = calculate_task_evaluation_metrics(
+            task_data, result,
+        )
         logger.info(
             "Task %s done. Reward: %.2f, Steps used: %d, Time: %.1fs",
             instance_id,
